@@ -1,0 +1,37 @@
+# telomere-read-cluster
+#
+# The stack is pinned and the environment is the unit of reproducibility.  The
+# reason is on the record: node-local dist-packages drift once meant some
+# compute nodes carried a scikit-learn predating what the pipeline imported, so
+# tasks produced numbers that were not comparable depending on where they
+# landed.  Nothing here imports umap or numba any more, but the lesson stands.
+name: trc
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.10
+  - numpy=1.26.4
+  - scipy=1.12.0
+  # igraph carries the Leiden implementation trc.cluster is pinned to.  This
+  # is the version the pipeline was measured against -- the run that reproduces
+  # the curated 92-group partition at ARI 1.0000 used exactly it.  igraph
+  # renumbered from 0.11.x to 1.0.0, so a pin that looks like an older series
+  # is a different package generation, not a downgrade.
+  - python-igraph=1.0.0
+  # 0.24.1, not the 0.22.0 the pipeline was first measured against: 0.22.0
+  # pins libzlib <1.3 and there is no py310 build of it that co-exists with
+  # the rest of this list.  pysam is used in one place -- reading primary
+  # records out of a BAM in `trc.intake` -- and the BAM path was re-checked
+  # against the FASTQ path under 0.24.1, byte for byte.
+  - pysam=0.24.1
+  - pip
+
+# This file is now the whole environment.  TeloBP used to be a separate manual
+# step -- it could not be expressed here, because the fork the pipeline needs
+# lives in a checkout whose path differs per machine -- and the step was
+# routinely missed, so an env built from this file came out silently missing
+# its boundary caller and died at module 1.  It is vendored into
+# `trc/teloboundary.py` instead, which also took matplotlib off this list:
+# upstream pulls in matplotlib.pyplot at module scope, and that import was the
+# only reason it was ever here.  Nothing in `trc` plots.

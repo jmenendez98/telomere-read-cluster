@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telomere-read-cluster"
+version = "0.1"
+description = "Cluster telomere reads into chromosome ends: reads are nodes, shared k-mers are weighted edges"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "python-igraph>=0.10",
+  "pysam>=0.21",
+]
+
+[project.scripts]
+trc = "trc.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
