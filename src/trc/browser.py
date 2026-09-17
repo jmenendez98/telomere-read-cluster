@@ -268,6 +268,33 @@ def _cell(v, default):
     return default if v in ("", "NA") else v
 
 
+# The ten columns every `<sample>.reads.tsv` has, whichever module 3 wrote it.
+# Anything else in the table is that clusterer's own per-read diagnostic.
+BASE_COLUMNS = ("read_id", "cluster", "strength", "degree",
+                "n_informative_kmers", "boundary_b0", "sub_bp", "read_bp",
+                "orient", "qs")
+
+# What a read with no score carries, and what the page tests against.  Every
+# score so far is a share or a probability and so is >= 0; a read module 3
+# never saw has no score rather than a score of zero.
+NO_SCORE = -1.0
+
+
+def score_column(rows):
+    """The name of the clusterer's own column, or `""` if the table has none.
+
+    Discovered rather than declared, so a page built from a table does not
+    have to be told which module 3 produced it -- `trc.cluster` names the
+    column and this finds it, and a table with no extra column simply has no
+    score to draw.  More than one extra column is not a thing any module 3
+    writes, and is ignored rather than guessed at.
+    """
+    if not rows:
+        return ""
+    extra = [k for k in rows[0] if k not in BASE_COLUMNS]
+    return extra[0] if len(extra) == 1 else ""
+
+
 def _reads_table(rows):
     """The read table as arrays, from the file or from the rows a run has just
     written.  Both ends go through here, so the page's read set is the table's
@@ -302,8 +329,14 @@ def _reads_table(rows):
         return np.array([dtype(_cell(r.get(name), default)) for r in rows],
                         np.float64 if dtype is float else np.int64)
 
+    name = score_column(rows)
     return {
         "ids": ids, "cluster": cl, "reason": why,
+        # The clusterer's own per-read diagnostic, under the name module 3
+        # gave it.  The page prints it and nothing else reads it.
+        "score": (col(name, float, NO_SCORE) if name
+                  else np.full(len(ids), NO_SCORE)),
+        "score_name": name,
         # A read is in the graph if it was clustered, or if it was in the
         # graph when module 3 declined to place it.
         "ingraph": np.array([c >= 0 or w in CLUSTERER_REASONS or w == ""
@@ -985,11 +1018,16 @@ function status(){
   const c = cl(sel);
   el.innerHTML = '<b>' + A.ids[sel].slice(0,8) + '</b> → ' + CLABEL(c) +
     (A.ingraph[sel] ? '  strength ' + A.strength[sel].toFixed(1) +
-                      '  degree ' + A.degree[sel]
+                      '  degree ' + A.degree[sel] + SCORE(sel, 3)
                     : '  not in the graph') +
     '  array ' + bp(sel, 'b0') + '  sub ' + bp(sel, 'sub_bp');
 }
 const fmt = v => v.toLocaleString();
+// Module 3's own per-read number, named by module 3 and drawn only where
+// there is one: a table from a clusterer that reports nothing has no
+// `scoreName`, and a read that never reached the clusterer has NO_SCORE.
+const SCORE = (i, dp) => (D.scoreName && A.score[i] >= 0)
+  ? '  ' + D.scoreName + ' ' + A.score[i].toFixed(dp) : '';
 // A length the read never had measured is NA and not 0: `b0` carries a zero
 // for those rows because the reads tab has to draw them somewhere, and a zero
 // drawn as a number would read as a boundary at the first base.
@@ -1001,6 +1039,7 @@ function detail(i){
     + (why ? '\n' + why : '')
     + (A.ingraph[i]
        ? '\nstrength ' + A.strength[i].toFixed(2) + '   degree ' + A.degree[i]
+         + SCORE(i, 4)
          + '\ninformative k-mers ' + fmt(A.nkmer[i])
        : '\nnot in the graph: no edges, no embedding, no box plot')
     + '\ntelomere b0 ' + bp(i, 'b0') + ' bp' +
@@ -2827,6 +2866,7 @@ def _page(sample, reads, edges, seqs, *, telo_bp, sub_bp, out_path,
     B.add("x", xy[:, 0], "float32").add("y", xy[:, 1], "float32")
     B.add("cluster", reads["cluster"], "int32")
     B.add("strength", reads["strength"], "float32")
+    B.add("score", reads["score"], "float32")
     B.add("qs", reads["qs"], "float32")
     for c in ("degree", "nkmer", "b0", "sub_bp", "read_bp"):
         B.add(c, reads[c], "int32")
@@ -2850,6 +2890,9 @@ def _page(sample, reads, edges, seqs, *, telo_bp, sub_bp, out_path,
     n_graph = int(reads["ingraph"].sum())
     data = {
         "sample": sample, "man": B.man,
+        # The name module 3 gave its per-read diagnostic, or "" if the table
+        # carried none.  The page shows the number beside `strength`.
+        "scoreName": reads.get("score_name", ""),
         # The reason vocabulary, in the pipeline's order and indexed by the
         # page's codes, plus a sentence a person can read for each.
         "reasons": list(UNPLACED_REASONS),

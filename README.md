@@ -102,8 +102,14 @@ is left out.
 
 ```
 read_id  cluster  strength  degree  n_informative_kmers
-         boundary_b0  sub_bp  read_bp  orient  qs
+         boundary_b0  sub_bp  read_bp  orient  qs  cohesion
 ```
+
+The first ten columns are fixed. The eleventh is module 3's own per-read
+number, under the name that module gives it — `cohesion`, the share of the
+read's edge weight that stays inside its cluster — and the browser discovers
+it as whatever column is not one of the ten rather than being told which
+module 3 wrote the table.
 
 `cluster` is an integer, or `unclustered:<reason>` naming the gate that lost
 the read. The reasons are, in the order a read reaches them:
@@ -111,7 +117,7 @@ the read. The reasons are, in the order a read reaches them:
 | `cluster` | from | the read |
 |---|---|---|
 | `0`, `1`, … | `cluster.py` | was placed in that cluster |
-| `unclustered:weak_edges` | `cluster.py` | had total edge weight under `cluster.REJECT_FRAC` × the graph's median. That constant is 0, so this reason no longer fires |
+| `unclustered:disputed` | `cluster.py` | had under `cluster.MIN_COHESION` of its edge weight inside the cluster it was placed in |
 | `unclustered:small_cluster` | `cluster.py` | was in a cluster left under `--reject-min-size` |
 | `unclustered:no_kmers` | `graph.py` | had no informative k-mer, so it was held out of the graph |
 | `unclustered:short_sub` | `intake.py` | had under `--min-subtelo-bp` of subtelomere past the boundary |
@@ -251,36 +257,61 @@ would have to come from somewhere, and the only honest source for that number
 is the answer, which is not available at run time. Nothing in these three
 modules reads a label of any kind.
 
-**"Nowhere" is an answer this pipeline is allowed to give.** A read is reported
-`unclustered:small_cluster` when what is left of its cluster is under
-`--reject-min-size`. Nothing is ever moved into a neighbouring cluster.
+**"Nowhere" is an answer this pipeline is allowed to give.** Leiden cannot give
+it — a partition labels every vertex — so both rules that produce an unplaced
+read run after it, and nothing is ever moved into a neighbouring cluster:
 
-That rule reads the **partition**, not the graph: a read is unplaced because
-Leiden left it by itself or in a group too small to be a chromosome end. A
-second rule used to run before it — `--reject-frac`, which unplaced a read
-whose total edge weight fell under a fraction of the graph's median — and it is
-gone, because what it needed was a number and the number had no source in the
-reads. It survives as `cluster.REJECT_FRAC`, a constant, at 0.
+| reason | what it reads |
+|---|---|
+| `unclustered:disputed` | the **graph**, against the partition: under `cluster.MIN_COHESION` of the read's edge weight lies inside the cluster Leiden put it in |
+| `unclustered:small_cluster` | the **partition**: what is left of the read's cluster is under `--reject-min-size` |
 
-The weight rule was the one that did the work, and what it did is worth
-recording since the size floor now has to do it alone. Total edge weight
-separates the reads a curator refused to group at AUC 0.973; cluster size does
-so at 0.25–0.69, at or below a coin flip, because most such reads sit *inside*
-real thirty-read groups. Degree could not work while the per-node cap was in
-place: it floored degree by construction and left it carrying almost nothing.
-With `graph.EDGE_K = 0` degree varies again and has not been re-measured.
+In that order, so the size floor is applied to the clusters that remain after
+the disputed reads leave.
 
-Turning the weight rule off **gains** ARI on today's graph, which is the reason
-it could go without an argument about it. Over the ten curated sets at
-`--reject-min-size 5`, 0.45 scores 0.846 (worst 0.733, 80 clusters, 38 reads
-unplaced a sample) and 0 scores **0.853** (worst 0.745, 81 clusters, 2
-unplaced). The curve peaks at 0.25 (0.854) — 0.45 was the peak of a flat
-0.42–0.46 band when it was swept, but that sweep ran against a graph capped at
-eight edges a node, and on the uncapped graph 0.45 has fallen off the far side.
-0 is the second-best point on the curve and the only one that is not a number
-somebody chose. What it costs is coverage of the rejection question, not
-accuracy: this pipeline now says "nowhere" about twenty times less often, and
-`--reject-min-size` cannot take that up — over 1 to 10 it spans 0.0002 of ARI.
+`cohesion` is that share, and it is **weighted**, which is the whole of the
+rule. A read on the boundary between two real clusters has edges leaving it,
+but module 2 has already priced those edges and at a real boundary they are
+worth almost nothing; counting them instead of weighing them throws out reads
+whose placement nothing ever doubted, and weighing them the same reads read
+0.9999. It is also a **ratio rather than a level**, and that is forced: module
+2 solves each read's sigma so its outgoing weight sums to exactly `log2(k)`,
+which floors every read's strength however empty its neighbourhood is, so a
+level-based rule has nothing left to cut. A share is unaffected by that floor.
+
+On **one** sample — HG08434.LCL-ONT-UL, 2,523 graph reads the curators sorted
+into 92 clusters while refusing 12, at `--reject-min-size 5`:
+
+| rule | k | unplaced | ARI | shattered | merged | refused caught |
+|---|---|---|---|---|---|---|
+| no refusal | 92 | 0 | 0.9962 | 3 | 2 | 0/12 |
+| `cohesion < 0.99` | 92 | 19 | **0.9972** | 2 | 2 | **12/12** |
+
+All twelve, at a precision of 0.63, and cohesion ranks the refused reads
+against the rest at **AUC 0.998** — where total edge weight reaches 0.973 and
+cluster size 0.25–0.69, at or below a coin flip, because most refused reads sit
+*inside* real thirty-read groups. Degree has never been a usable signal either,
+though for a reason that has since gone away: the per-node edge cap floored it
+by construction. With `graph.EDGE_K = 0` degree varies again and has not been
+re-measured. The partition also gets **better** rather
+than just smaller: one of the three curated clusters it used to shatter was
+shattered by a single read bridging it, and with that read unplaced the cluster
+comes back whole. Moving the read anywhere would have kept the bridge. This is
+one sample; the ten-set numbers below predate the rule.
+
+**The rule it replaces was `--reject-frac`**, which unplaced a read whose total
+edge weight fell under a fraction of the graph's median. It is gone, constant
+and all. What it needed was a number with no source in the reads: 0.45 was the
+peak of a flat 0.42–0.46 band swept against a graph that capped every node at
+eight edges, and no such cap has existed since. Over the ten curated sets at
+`--reject-min-size 5` it had already fallen off the far side of its own peak —
+0.45 scored 0.846 (worst 0.733, 80 clusters, 38 reads unplaced a sample) where
+turning it off scored **0.853** (worst 0.745, 81 clusters, 2 unplaced), and the
+curve peaked at 0.25 (0.854). `cluster.MIN_COHESION` is a number too, and the
+difference is where it comes from: it is not the peak of a swept curve but a
+point inside a gap the distribution opens by itself — 19 reads at 0.9655 and
+below, then nothing at all until 0.9999, then 8 reads and 2,496 at exactly 1 —
+so every cut in (0.9655, 0.9998] returns the same 19 reads.
 
 ## Defaults
 
@@ -299,14 +330,14 @@ cross-sample. Seven of the eight samples improve; HG08435.PBMC-ONT-LSK does
 not, splitting into 93 clusters where the curator drew 92.
 
 One of these parameters was measured to do **nothing** on a whole-sample pool
-and is kept because it is now the only rejection rule there is rather than for
-its effect: see `--reject-min-size` below.
+and is kept for what it guards against rather than for its effect: see
+`--reject-min-size` below.
 
 **Modules 2 and 3 have since moved off the point that sweep selected**, and
 these numbers are the sweep's. `-k` is 48 rather than 32; the per-node edge cap
 is gone (`graph.EDGE_K = 0`); both df gates are off (`graph.MIN_K_N = 1`,
-`graph.MAX_K_FRAC = 1.0`); the weight-rejection rule is off
-(`cluster.REJECT_FRAC = 0`). End to end over the ten curated sets in
+`graph.MAX_K_FRAC = 1.0`); the weight-rejection rule is gone entirely, replaced
+by the cohesion refusal. End to end over the ten curated sets in
 `out/manually-curated-truth-sets`, that configuration scores ARI **0.853**
 (worst 0.745) and finds 81 clusters where the curators drew 92. Each constant
 records its own cost beside itself, in `graph.py` and `cluster.py`.
@@ -322,7 +353,7 @@ records its own cost beside itself, in `graph.py` and `cluster.py`.
 | `--telo-regex` | teloBP's C-strand pattern | a first pass at the two length gates, from composition alone and before the boundary is called, so a hopeless read does not cost teloBP's ~280 ms. Empty turns it off |
 | `--bound-margin` | 5000 | how far past the array teloBP's boundary scan may look. Bounding it is the whole reason for the `itsfix` fork; widening it gives a nearby ITS more room to capture the call |
 | `--snap-bp` | 500 | the boundary is the origin every read is measured from, and teloBP calls it from a 750 bp smoothed window, so it carries that smoothing as slop. Snapping moves it onto the end of the last run of `--telo-regex` — a landmark the reads *share*, since it is the pattern the whole pool is judged by. Measured on HG08434 LCL-ONT-UL, per-column agreement across the 300 bp of array behind `b0` with the clusters held fixed: **0.859** unsnapped, 0.959 onto the last tandem run end (what this used to do), **0.964** onto the last regex run end. It fires on 81% of reads and moves `b0` by a median of 6 bp (p90 105); 76 of 92 clusters improve, the worst loses 0.027. The score saturates by 250 — every value from there to 600 gives the same tables on this sample, since a run end further than that from the call is rare — so 500 is headroom rather than a fitted number. 0 is off, and so is an empty `--telo-regex` |
-| `--reject-min-size` | 5 | **near-inert**: over the ten curated sets, 1 through 10 span 0.0002 ARI, and all it moves is the cluster count — 81.6 at 1, 80.2 at 10, against a truth of 92, so raising it walks away from the answer. Cluster size separates the reads a curator refused to group at AUC 0.25–0.69, at or below a coin flip, because most such reads sit inside real thirty-read groups. Left at 5 rather than moved on a difference this small, and it is now the only rejection rule there is |
+| `--reject-min-size` | 5 | **near-inert**: over the ten curated sets, 1 through 10 span 0.0002 ARI, and all it moves is the cluster count — 81.6 at 1, 80.2 at 10, against a truth of 92, so raising it walks away from the answer. Cluster size separates the reads a curator refused to group at AUC 0.25–0.69, at or below a coin flip, because most such reads sit inside real thirty-read groups. Left at 5 rather than moved on a difference this small. It is no longer the only rejection rule — `cluster.MIN_COHESION` is the one that does the work — and it runs second, on the clusters left after the disputed reads go, so a real group that was only small because two disputed reads hung off it is not then ejected whole |
 
 ## Caching
 

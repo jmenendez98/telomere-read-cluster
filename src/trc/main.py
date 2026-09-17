@@ -9,7 +9,7 @@ One invocation runs all three modules end to end:
 
     1  intake   FASTQ/BAM -> reads oriented telomere-first, boundary called
     2  graph    reads as nodes, shared k-mers as weighted edges
-    3  cluster  the graph cut into clusters, weakly-attached reads unplaced
+    3  cluster  the graph cut into clusters, disputed reads unplaced
 
 `--browser` adds one more file and no stage: `trc.browser` draws the finished
 run as a self-contained HTML page, built from what is still in memory when the
@@ -19,7 +19,7 @@ hold.
 **THE TWO TABLES HOLD EVERY RECORD OF THE INPUT FILE.**  A read that no gate
 lost carries its cluster id; every other read carries the gate that lost it,
 as `unclustered:<reason>` -- `unclustered:low_qs`, `unclustered:no_kmers`,
-`unclustered:weak_edges`.  So `wc -l` on `<sample>.reads.tsv` is the record
+`unclustered:disputed`.  So `wc -l` on `<sample>.reads.tsv` is the record
 count of the input, `<sample>.clusters.tsv` has a row per kind of unclustered
 beside its rows per cluster, and a read that is not in a cluster is in the
 table saying why rather than being absent from it.  A column belonging to a
@@ -32,12 +32,15 @@ below with its default or as a named constant in the module that reads it, so
 a config file, or a hardcoded path.
 
 Module 2 holds two of them -- `graph.MIN_K_N` and `graph.MAX_K_FRAC`, the two
-document-frequency gates of step 1 -- and module 3 one more,
-`cluster.REJECT_FRAC`.  Each is a value that was a flag until a sweep found it
-had one setting worth shipping, so it is written where the measurement that
-chose it can be read beside it.  All three are now at the setting that does
-nothing, which is the only setting a constant can hold without being a tuned
-number in hiding.  Module 2's kernel adds two more that are not of that kind:
+document-frequency gates of step 1.  Each is a value that was a flag until a
+sweep found it had one setting worth shipping, so it is written where the
+measurement that chose it can be read beside it.  Both are now at the setting
+that does nothing, which is the only setting a constant can hold without being
+a tuned number in hiding.  Module 3 carries one of a different kind,
+`cluster.MIN_COHESION`, and it is not at the setting that does nothing: it is
+the refusal, and what makes it not a tuned number is that the distribution it
+cuts has nothing within 0.024 of it below or 0.0098 above -- the measurement
+is at the constant.  Module 2's kernel adds two more:
 `graph.SMOOTH_ITERS` and `graph.MIN_SIGMA_FRAC` are a bisection's step count
 and a guard against dividing by zero, neither swept nor sweepable.  Intake
 used to carry two more, a lead-in and an orientation ratio, for a canonical-
@@ -64,10 +67,15 @@ sits further from the hub that appears past 20.  It is still the first number
 to put on a curve over all ten.  `--mix-ratio` has been swept over that same
 one sample, where 0.25-0.75 are indistinguishable and 1.0 -- UMAP's own
 default -- merges a pair of chromosome ends that share no edge; 0.5 is the
-middle of that band and the point where the mix becomes a plain average.  The
-weight-rejection threshold is `cluster.REJECT_FRAC` and is 0: a read is now
-unplaced because the partition left it alone, not because its strength fell
-under a swept fraction -- see `cluster.py`.
+middle of that band and the point where the mix becomes a plain average.
+
+**Module 3's refusal is a RATIO, not a level.**  A read is unplaced when under
+`cluster.MIN_COHESION` of its edge weight lies inside the cluster Leiden put it
+in.  The rule it replaces cut on the level -- total edge weight under a
+fraction of the graph's median -- and module 2's kernel makes that
+uncuttable: it solves each read's sigma so the read's outgoing weight sums to
+exactly `log2(k)`, which floors every read's strength no matter how empty its
+neighbourhood is.  A share is unaffected by that floor.  See `cluster.py`.
 
 The two length gates are set above what those samples required.
 `--min-subtelo-bp` is held at or above `--sub-bp` rather than at the 150 bp
@@ -394,7 +402,7 @@ def _write_reads(path, reads, dropped, G, a):
 
         <id>                  Leiden put the read in that cluster
         unclustered:<rule>    it reached module 3, which unplaced it --
-                              `weak_edges` or `small_cluster`
+                              `disputed` or `small_cluster`
         unclustered:no_kmers  it reached module 2 with no informative k-mer
                               and was held out of the graph
         unclustered:<gate>    module 1 dropped it: `low_qs`, `both_ends`,
@@ -413,6 +421,14 @@ def _write_reads(path, reads, dropped, G, a):
     """
     cols = ["read_id", "cluster", "strength", "degree", "n_informative_kmers",
             "boundary_b0", "sub_bp", "read_bp", "orient", "qs"]
+    # Module 3's own per-read diagnostic, under whatever name that module
+    # gives it.  A method that produces none writes no column, so the table's
+    # width says which module 3 built it.  NOTHING HERE BRANCHES ON IT -- it
+    # is reported so the tables and the page can be read, and the one rule
+    # that branches on it lives in `trc.cluster` with the number it cuts at.
+    score = getattr(a, "score_col", "") or ""
+    if score:
+        cols.append(score)
     labels = a.labels()
     rows = []
     for i, r in enumerate(reads):
@@ -426,6 +442,9 @@ def _write_reads(path, reads, dropped, G, a):
                      "boundary_b0": r.b0, "sub_bp": r.sub_bp,
                      "read_bp": len(r.seq), "orient": r.orient,
                      "qs": _num(r.qs)})
+        if score:
+            rows[-1][score] = (float(a.scores[v])
+                               if 0 <= v < len(a.scores) else None)
     for d in dropped:
         rows.append({"read_id": d.read_id,
                      "cluster": unplaced_label(d.reason),
@@ -434,6 +453,8 @@ def _write_reads(path, reads, dropped, G, a):
                      "boundary_b0": _num(d.b0), "sub_bp": _num(d.sub_bp),
                      "read_bp": len(d.seq), "orient": d.orient or None,
                      "qs": _num(d.qs)})
+        if score:
+            rows[-1][score] = None
     write_tsv(path, rows, cols)
     return rows
 
@@ -578,6 +599,10 @@ def main(argv=None):
             "unplaced": _unplaced_tally(rows),
             "graph": G.report,
             "cluster_method": chosen.name,
+            # Whatever the pinned method had to work out for itself -- the
+            # number its refusal cut at, and where the two sides of that cut
+            # actually sat on this run.
+            "cluster_detail": getattr(chosen, "detail", {}),
             "n_clusters": chosen.n_clusters,
             "n_unclustered": chosen.n_unclustered,
             "largest_cluster": chosen.largest,
