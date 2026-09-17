@@ -1,14 +1,14 @@
 """The command line.  Almost every parameter of every stage is a flag here.
 
     trc reads.fq.gz -o out/HG08434
-    trc reads.bam   -o out/HG08434 -k 30 --edge-k 14
+    trc reads.bam   -o out/HG08434 -k 30 --telo-bp 2500
     trc reads.fq.gz -o out/HG08434 --cache out/HG08434/cache
     trc reads.fq.gz -o out/HG08434 --browser
 
 One invocation runs all three modules end to end:
 
     1  intake   FASTQ/BAM -> reads oriented telomere-first, boundary called
-    2  graph    reads as nodes, shared k-mers as weighted edges, top-k
+    2  graph    reads as nodes, shared k-mers as weighted edges
     3  cluster  the graph cut into clusters, weakly-attached reads unplaced
 
 `--browser` adds one more file and no stage: `trc.browser` draws the finished
@@ -31,39 +31,61 @@ below with its default or as a named constant in the module that reads it, so
 `run.json` is a complete record of one.  Nothing reads an environment variable,
 a config file, or a hardcoded path.
 
-There are no such constants left.  Intake used to carry two -- a lead-in and
-an orientation ratio -- for a canonical-hexamer density scan that decided which
-end of a read was the telomere.  teloBP answers that itself, and with its own
-strand call in place the scan, its three flags and both constants are gone.
+Module 2 holds two of them -- `graph.MIN_K_N` and `graph.MAX_K_FRAC`, the two
+document-frequency gates of step 1 -- and module 3 one more,
+`cluster.REJECT_FRAC`.  Each is a value that was a flag until a sweep found it
+had one setting worth shipping, so it is written where the measurement that
+chose it can be read beside it.  All three are now at the setting that does
+nothing, which is the only setting a constant can hold without being a tuned
+number in hiding.  Module 2's kernel adds two more that are not of that kind:
+`graph.SMOOTH_ITERS` and `graph.MIN_SIGMA_FRAC` are a bisection's step count
+and a guard against dividing by zero, neither swept nor sweepable.  Intake
+used to carry two more, a lead-in and an orientation ratio, for a canonical-
+hexamer density scan that decided which end of a read was the telomere.
+teloBP answers that itself, and with its own strand call in place the scan,
+its three flags and both constants are gone.
 
-**The defaults are a measured configuration, not a guess.**  `-k 32
---telo-bp 3000 --sub-bp 600 --min-k-n 3 --edge-k 8 --reject-frac 0.45
---reject-min-size 5` is the point selected over eight hand-curated samples in
-`benchmark/parameterization/`, where it scores ARI 0.995 against the curators'
-labels where the previous configuration scored 0.989, and recovers the cluster
-splits the curators had to make by hand.  It is the CENTRE of a plateau rather
-than its argmax: 144 of 1,033 configurations scored within 0.001 of the best,
-and with eight samples the standard error on that mean is ~0.0009, so the
-points inside the plateau are not distinguishable from one another.
-`--edge-k` in particular is small for a counting reason rather than a tuning
-one -- see `graph.py`.
+**The defaults are a measured configuration, not a guess.**  `-k 48
+--telo-bp 3000 --sub-bp 600 --reject-min-size 5` is the point selected over
+eight hand-curated samples in `benchmark/parameterization/`, where it scores
+ARI 0.995 against the curators' labels where the previous configuration scored
+0.989, and recovers the cluster splits the curators had to make by hand.  It
+is the CENTRE of a plateau rather than its argmax: 144 of 1,033 configurations
+scored within 0.001 of the best, and with eight samples the standard error on
+that mean is ~0.0009, so the points inside the plateau are not distinguishable
+from one another.  That sweep was run against the TF-IDF cosine graph module 2
+used to build, so what it selected is `-k`, `--telo-bp` and `--sub-bp` -- step
+1's window, which steps 2 to 4 did not change.
+
+`--n-neighbors` has not been swept over those samples either; its 10 is the
+low end of the 10-15 plateau on the ONE sample where it has been swept, chosen
+there over 15 -- UMAP's own default -- because the two score the same and 10
+sits further from the hub that appears past 20.  It is still the first number
+to put on a curve over all ten.  `--mix-ratio` has been swept over that same
+one sample, where 0.25-0.75 are indistinguishable and 1.0 -- UMAP's own
+default -- merges a pair of chromosome ends that share no edge; 0.5 is the
+middle of that band and the point where the mix becomes a plain average.  The
+weight-rejection threshold is `cluster.REJECT_FRAC` and is 0: a read is now
+unplaced because the partition left it alone, not because its strength fell
+under a swept fraction -- see `cluster.py`.
 
 The two length gates are set above what those samples required.
 `--min-subtelo-bp` is held at or above `--sub-bp` rather than at the 150 bp
 that was lossless there, so a read reaching the graph can fill the subtelomere
-window instead of merely clearing it; `--min-telo-bp` is likewise above the 252 bp
-floor the density scan can report, so it trims short arrays rather than only
-arrayless reads.  Both trade reads for profiles built entirely of sequence
-that is present.
+window instead of merely clearing it; `--min-telo-bp` is likewise above the
+252 bp floor the density scan can report, so it trims short arrays rather than
+only arrayless reads.  Both trade reads for profiles built entirely of
+sequence that is present.
 
 **Caching is opt-in and stamped.**  `--cache DIR` stores everything a run
 produces that is not one of the two result tables: intake (teloBP is ~280 ms a
 read, a quarter of an hour a sample), the k-mer database, every read x k-mer
-matrix -- raw counts, `log1p` of them, TF-IDF, presence -- the dense cosine,
+matrix -- raw counts, `log1p` of them, TF-IDF, presence -- the dense weight
+matrix,
 and the exported edge list and `run.json` alongside them.  A stamp covers the
 input file, the parameters each stage reads and the source of the modules that
-produce it, so a re-run that changes `--edge-k` or the clusterer reuses all of
-it and a re-run that changes `-k` reuses only intake.  Without the flag nothing
+produce it, so a re-run that changes only the clusterer reuses all of it and
+a re-run that changes `-k` reuses only intake.  Without the flag nothing
 is written or read, and `<sample>.edges.tsv` and `<sample>.run.json` are not
 produced at all.
 """
@@ -155,37 +177,43 @@ def build_parser():
 
     # ------------------------------------------------------------- 3. graph
     b = p.add_argument_group("read/k-mer graph")
-    b.add_argument("-k", type=int, default=32,
+    b.add_argument("-k", type=int, default=48,
                    help=f"k-mer length.  Exact and collision-free up to "
                         f"{_graph_mod.EXACT_MAX_K}; {_graph_mod.EXACT_MAX_K + 1}"
                         f"-{_graph_mod.MAX_K} are 64-bit hashes and are "
-                        f"labelled as such")
+                        f"labelled as such.  48 over 32 is worth 0.003 of ARI "
+                        f"on the curated sets and is the single largest "
+                        f"module-2 effect measured: every weighting that beat "
+                        f"the cosine this module used to ship did so by "
+                        f"reading MORE SEQUENCE PER FEATURE, and raising k "
+                        f"is the cheapest way to do it")
     b.add_argument("--telo-bp", type=int, default=3000,
                    help="how far back into the array to scan; 0 means back to "
                         "the read's own tip")
     b.add_argument("--sub-bp", type=int, default=600,
                    help="how far into the subtelomere to scan")
-    b.add_argument("--min-k-n", type=int, default=3,
-                   help="a k-mer must appear in at least this many reads.  "
-                        "Below 2 it cannot form an edge at all")
-    b.add_argument("--max-k-frac", type=float, default=0.5,
-                   help="a k-mer in more than this fraction of reads is "
-                        "dropped.  Must stay above the largest group's share "
-                        "of the pool, or that group loses the k-mers that "
-                        "define it.  1.0 drops only k-mers in every read")
-    b.add_argument("--edge-k", type=int, default=8,
-                   help="edges kept at each node, as a symmetric union.  A "
-                        "read in a group of m reads has only m-1 possible "
-                        "in-group partners, so this must stay below the "
-                        "smallest group you expect to recover")
-
+    b.add_argument("--n-neighbors", type=int, default=10, metavar="K",
+                   help="how many nearest reads each read is given a weight "
+                        "to.  It sets the neighbourhood the kernel's rho and "
+                        "sigma are read off, and it is the only cut in module "
+                        "2: a pair outside both reads' K is never given a "
+                        "weight, and no pair is ever dropped for the SIZE of "
+                        "its weight.  Every read gets the same K, so a read "
+                        "in a dense arm has no more say than one in a sparse "
+                        "arm")
+    b.add_argument("--mix-ratio", type=float, default=_graph_mod.MIX_RATIO,
+                   metavar="R",
+                   help="how step 4 joins the two directions of a pair: the "
+                        "fuzzy union a+b-ab at 1, the fuzzy intersection a*b "
+                        "at 0, and their mean (a+b)/2 at the default 0.5, "
+                        "where the product cancels.  It is what a ONE-WAY "
+                        "claim is worth beside a mutual one, and the only "
+                        "place in module 2 where being CHOSEN differs from "
+                        "choosing.  Above 0 it reweights the same edges; at "
+                        "0 it deletes every one-way pair, which on the "
+                        "curated sample is three fifths of them")
     # ----------------------------------------------------------- 4. cluster
     c = p.add_argument_group("cluster assignment")
-    c.add_argument("--reject-frac", type=float, default=0.45,
-                   help="report a read unclustered when its total edge weight "
-                        "is below this fraction of the graph's median.  "
-                        "Decided on the graph before the clustering "
-                        "runs.  0 rejects nothing")
     c.add_argument("--reject-min-size", type=int, default=5,
                    help="report a read unclustered when what is left of its "
                         "cluster is smaller than this.  Nothing is ever moved "
@@ -203,7 +231,7 @@ def build_parser():
                    help="write everything but the two result tables to this "
                         "directory, each file stamped on the input and the "
                         "parameters it depends on: intake, the k-mer "
-                        "database, every read/k-mer matrix, the cosine, and "
+                        "database, every read/k-mer matrix, the weights, and "
                         "<sample>.edges.tsv and <sample>.run.json.  Without "
                         "it those last two are not produced")
     d.add_argument("--browser", action="store_true",
@@ -284,28 +312,24 @@ def _window_name(args):
     return f"k{args.k}.{cap}.sub{args.sub_bp}"
 
 
-def _gate_name(args):
-    """The df gates, in the FILENAME for the reason the window is.
-
-    They move everything below the k-mer database -- which columns survive, and
-    so the matrices and the cosine over them -- while leaving the database
-    itself alone.  Two gate settings sharing one file would take turns
-    overwriting it, each finding the other's stamp wrong, and a sweep over
-    `--max-k-frac` would pay for every build and never hit the cache.
-    """
-    return f"n{args.min_k_n}.x{args.max_k_frac:g}"
-
-
 def _graph_stage(args, reads, cachedir, intake_sig):
-    """Module 2, with the database, the matrices and the cosine cached apart.
+    """Module 2, with the database, the matrices and the weights cached apart.
 
-    Three caches and not one, because they are invalidated by different things:
-    `--min-k-n` and `--max-k-frac` move the matrices and the cosine and leave
-    the database alone, and `--edge-k` and everything in module 3 move none of
-    the three.
+    Three caches and not one, because they cost different things to rebuild
+    and to store: the weights are the expensive half of the module and the
+    smallest file, and the matrices are wanted whole by anything that wants a
+    column.  The first two carry the SAME stamp -- the df gates that used to
+    move the matrices while leaving the database alone are `graph.MIN_K_N` and
+    `graph.MAX_K_FRAC`, constants, and a change to either is a change to the
+    module's code signature, which every one of the three stamps holds.
+
+    The weights carry that stamp plus `--n-neighbors` and `--mix-ratio`, the
+    two parameters that move steps 2-4 without moving the k-mer matrices above
+    them: sweeping either rebuilds the weights and reuses the database and the
+    matrices, which is where the time is.  Both are in the file name, so the
+    settings of a sweep sit side by side in one cache directory.
     """
     name = _window_name(args)
-    gated = f"{name}.{_gate_name(args)}"
     db_kw = dict(k=args.k, telo_bp=args.telo_bp, sub_bp=args.sub_bp)
     csig = code_sig(_graph_mod)
     db_sig = f"{intake_sig}|{param_sig(**db_kw)}|{csig}|n={len(reads)}"
@@ -321,31 +345,33 @@ def _graph_stage(args, reads, cachedir, intake_sig):
                                      np.array([r.b0 for r in reads]), **db_kw)
         save_npz(db_path, db_sig, **_graph_mod.kmerdb_arrays(db))
 
-    gate_kw = dict(min_k_n=args.min_k_n, max_k_frac=args.max_k_frac)
-    gate_sig = f"{db_sig}|{param_sig(**gate_kw)}"
-
-    vec_path = (cache_path(cachedir, f"vectors.{gated}.npz")
+    vec_path = (cache_path(cachedir, f"vectors.{name}.npz")
                 if cachedir else None)
     vec = None
-    zv = load_npz(vec_path, gate_sig)
+    zv = load_npz(vec_path, db_sig)
     if zv is not None:
         vec = _graph_mod.vectors_from_arrays(zv)
 
-    cos_path = (cache_path(cachedir, f"cosine.{gated}.npz")
-                if cachedir else None)
-    S = None
-    zc = load_npz(cos_path, gate_sig)
+    w_par = param_sig(n_neighbors=args.n_neighbors,
+                      mix_ratio=args.mix_ratio)
+    w_sig = f"{db_sig}|{w_par}"
+    w_path = (cache_path(cachedir, f"weights.{name}.nn{args.n_neighbors}"
+                         f".mix{args.mix_ratio:g}.npz")
+              if cachedir else None)
+    W = None
+    zc = load_npz(w_path, w_sig)
     if zc is not None:
-        S = np.asarray(zc["S"], np.float64)
+        W = _graph_mod.weights_from_arrays(zc)
 
-    G, db, vec, S = _graph_mod.build(reads, edge_k=args.edge_k, db=db, vec=vec,
-                                     S=S, **db_kw, **gate_kw)
+    G, db, vec, W = _graph_mod.build(reads, db=db, vec=vec, W=W,
+                                     n_neighbors=args.n_neighbors,
+                                     mix_ratio=args.mix_ratio, **db_kw)
     if vec_path and zv is None:
         # Raw counts, log1p of them, TF-IDF, and the columns they are over.
         # Presence is all ones and is rebuilt from the same structure.
-        save_npz(vec_path, gate_sig, **_graph_mod.vectors_arrays(vec))
-    if cos_path and zc is None:
-        save_npz(cos_path, gate_sig, S=np.asarray(S, np.float32))
+        save_npz(vec_path, db_sig, **_graph_mod.vectors_arrays(vec))
+    if w_path and zc is None:
+        save_npz(w_path, w_sig, **_graph_mod.weights_arrays(W))
     return G
 
 
@@ -515,16 +541,9 @@ def main(argv=None):
     if args.k > _graph_mod.MAX_K:
         raise SystemExit(f"-k {args.k} exceeds the ceiling of "
                          f"{_graph_mod.MAX_K}")
-    if args.edge_k < 1:
-        raise SystemExit("--edge-k must be at least 1")
-    if args.min_k_n < 2:
-        raise SystemExit("--min-k-n below 2 admits k-mers in a single read, "
-                         "which cannot form an edge")
-    if not 0 < args.max_k_frac <= 1.0:
-        raise SystemExit("--max-k-frac must be in (0, 1]")
-    if args.reject_frac < 0:
-        raise SystemExit("--reject-frac must be >= 0 (0 rejects nothing)")
-
+    if not 0.0 <= args.mix_ratio <= 1.0:
+        raise SystemExit(f"--mix-ratio {args.mix_ratio} is outside [0, 1]; "
+                         f"it is a mix of two set operations, not a scale")
     sample = args.sample or os.path.basename(args.input).split(".")[0]
     os.makedirs(args.out, exist_ok=True)
     cachedir = args.cache
@@ -536,8 +555,7 @@ def main(argv=None):
     G = _graph_stage(args, reads, cachedir, isig)
     _cluster_mod.seed_all(args.seed)
     chosen = _cluster_mod.run(
-        G, seed=args.seed, reject_frac=args.reject_frac,
-        reject_min_size=args.reject_min_size)
+        G, seed=args.seed, reject_min_size=args.reject_min_size)
 
     base = os.path.join(args.out, sample)
     rows = _write_reads(f"{base}.reads.tsv", reads, dropped, G, chosen)

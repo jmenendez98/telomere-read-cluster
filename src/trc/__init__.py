@@ -5,9 +5,11 @@ Three modules, run end to end by one command (`trc`, or `python -m trc`):
     1  trc.intake    FASTQ/BAM -> reads put on the C strand by teloBP's own
                      strand call, with its array/subtelomere boundary `b0`
     2  trc.graph     reads become nodes and shared k-mers become weighted
-                     edges: a TF-IDF cosine over the k-mers of one window
-                     across the array/subtelomere junction, kept at the top
-                     `edge_k` per node
+                     edges: TF-IDF vectors over the k-mers of one window
+                     across the array/subtelomere junction, Euclidean
+                     distances between them, and a locally scaled exponential
+                     kernel over each read's `--n-neighbors` nearest, the two
+                     directions of a pair mixed at `--mix-ratio`
     3  trc.cluster   the graph is cut by igraph's Leiden on modularity,
                      iterated to convergence, and reads attached to nothing in
                      particular are reported unclustered rather than moved

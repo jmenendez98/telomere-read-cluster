@@ -30,15 +30,16 @@ invented for it.  A read with no boundary is drawn anchored at its own first
 base, which leaves the telomere half of its row empty -- the picture of "no
 array was called here".
 
-**THE EMBEDDING IS OF THE GRAPH, NOT OF THE COSINE.**  Affinities are built
-from `<sample>.edges.tsv` -- the top-`edge_k` symmetric union that module 3 was
-handed -- and not from the dense cosine in the cache.  A read's neighbours here
-are the ones it was clustered on, so a read drawn away from its cluster is a
-statement about the object that produced the clusters.  It also means the
+**THE EMBEDDING IS OF THE GRAPH, NOT OF THE DISTANCES.**  Affinities are built
+from `<sample>.edges.tsv` -- the two directed kernels mixed at `--mix-ratio`,
+which is what module 3 was handed -- and not from the dense distance matrix
+the weights came from.  A read's neighbours here are the ones it was clustered
+on, so a read drawn away from its cluster is a statement about the object that
+produced the clusters.  It also means the
 picture is only as complete as the graph: two reads with no edge between them
-have no affinity at all, however similar their vectors were before `top_edges`
-cut them apart.  The run's own `n_components` (73 on HG08434) is visible on the
-map as blobs that never touch.
+have no affinity at all, however similar their vectors were before each read's
+`--n-neighbors` cut them apart.  The run's own `n_components` -- 89 on HG08434
+at the shipped defaults -- is visible on the map as blobs that never touch.
 
 **t-SNE IS IMPLEMENTED HERE, IN NUMPY.**  `environment.yml` has no
 scikit-learn and this page is not worth adding one for: n is a few thousand, so
@@ -424,12 +425,13 @@ def _binary_search_sigma(d2, target, tol=1e-5, n_iter=60):
 def joint_p(n, i, j, w, perplexity):
     """The symmetric affinities P, from the graph's edges and nothing else.
 
-    Each read's row is built over ITS OWN NEIGHBOURS at distance `1 - cosine`,
+    Each read's row is built over ITS OWN NEIGHBOURS at distance `1 - weight`,
     perplexity-matched the usual way, and the rows are then symmetrised as
-    `(P + P')/2n`.  A pair with no edge gets exactly zero, which is the whole
-    difference between this and a t-SNE of the dense cosine: `top_edges` has
-    already decided who is allowed to attract whom, and this picture is of that
-    decision.
+    `(P + P')/2n`.  The edge weight is already in [0, 1], so `1 - w` is a
+    distance without further scaling.  A pair with no edge gets exactly zero,
+    which is the whole difference between this and a t-SNE of the dense
+    distances: module 2's neighbour lists have already decided who is allowed
+    to attract whom, and this picture is of that decision.
     """
     from scipy import sparse
     d = np.maximum(0.0, 1.0 - w)
@@ -1073,7 +1075,7 @@ function drawMap(){
   if($('#edges').checked){
     mx.lineWidth = 1;
     for(let b=0;b<ebuck.length;b++){
-      // Weight is the cosine: the ramp is deliberately steep at the top, so a
+      // Weight is the kernel's: the ramp is deliberately steep at the top, so a
       // 0.95 edge inside a cluster reads solid and a 0.3 edge between two of
       // them reads as the thread it is.
       const a = 0.035 + 0.20*Math.pow((b+0.5)/ebuck.length, 2);
@@ -2952,9 +2954,9 @@ def main(argv=None):
                          "run directory")
     ap.add_argument("--perplexity", type=float, default=PERPLEXITY,
                     help="t-SNE perplexity.  Keep it well under the graph's "
-                         "degree -- at --edge-k 10 the median read has 12 "
-                         "neighbours and there is no more neighbourhood than "
-                         "that to match")
+                         "degree -- a read has at least --n-neighbors "
+                         "neighbours and there is no more neighbourhood "
+                         "than that to match")
     ap.add_argument("--iterations", type=int, default=N_ITER, dest="n_iter",
                     help="t-SNE gradient steps")
     ap.add_argument("--seed", type=int, default=0,

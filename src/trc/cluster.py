@@ -1,6 +1,6 @@
 """Module 3 of 3: the graph is cut into clusters, and some reads are not placed.
 
-    result = assign(G, seed=0, reject_frac=0.35, reject_min_size=5)
+    result = run(G, seed=0, reject_min_size=5)
 
 **One method, pinned: igraph's Leiden on modularity, run to convergence.**
 `community_leiden(objective_function="modularity", n_iterations=-1)` -- the
@@ -18,22 +18,28 @@ is the answer, which is not available at run time.
 Nothing in this module reads a label of any kind.
 
 **"Nowhere" is an answer this module is allowed to give.**  A read is reported
-`unclustered:<rule>` rather than pulled into the nearest cluster when either
-rule fires, and the label names which one:
+`unclustered:<rule>` rather than pulled into the nearest cluster, and one rule
+puts it there:
 
-    --reject-frac      its total edge weight is under this fraction of the
-                       graph's median.  Decided ON THE GRAPH, before the
-                       clustering runs, so the rule is a statement about the
-                       read and not about the partition.
     --reject-min-size  what is left of its cluster is smaller than this.
 
-The first is the one that does the work.  Total edge weight separates the reads
-a curator refused to group from the rest at AUC 0.973, where cluster size does
-so at 0.25-0.69 -- at or below a coin flip, because most such reads sit INSIDE
-real thirty-read groups.  Degree cannot work and could not: `top_edges` gives
-every node its `edge_k` strongest neighbours by construction, so degree is
-floored and carries almost nothing.  It is the WEIGHT on those edges that says
-a read is attached to nothing in particular.
+That rule reads the PARTITION, not the graph.  A read is unplaced because
+Leiden left it by itself or in a group too small to be a chromosome end --
+which is a thing the clustering said, not a threshold carried in from a sweep.
+
+There was a second rule, `--reject-frac`, which unplaced a read whose total
+edge weight fell under a fraction of the graph's median, and on its own terms
+it worked: total edge weight separates the reads a curator refused to group
+from the rest at AUC 0.973, where cluster size does so at 0.25-0.69, at or
+below a coin flip.  It is gone anyway, because what it needed was a NUMBER and
+the number had no source in the reads.  0.45 was the peak of a flat 0.42-0.46
+band swept against a graph that capped every node at eight edges, and module
+2 no longer builds that graph at all, so the strength distribution that cut is
+a different distribution, and
+a fraction of the median lands at a different depth on every sample in any
+case -- the median of total edge weight varies 0.4% across the curated sets
+while the width of the low tail varies 13%.  `REJECT_FRAC` below is 0 and
+records what setting it there costs.
 
 Nothing is ever moved.  A pass that dissolves a small cluster and gives its
 reads to whichever neighbour holds most of their edge weight is the right pass
@@ -83,7 +89,8 @@ UNPLACED_REASONS = CLUSTERER_REASONS + (
 
 # For a person reading a label, not for anything that branches on one.
 REASON_TEXT = {
-    "weak_edges": "total edge weight under --reject-frac x the graph's median",
+    "weak_edges": "total edge weight under cluster.REJECT_FRAC x the "
+                  "graph's median",
     "small_cluster": "what was left of its cluster was under "
                      "--reject-min-size",
     "no_kmers": "no informative k-mer, so it was held out of the graph",
@@ -113,6 +120,38 @@ def unplaced_reason(label):
 
 # The pinned method, named for the log line and for `run.json`.
 METHOD = "igraph/leiden modularity"
+
+# The weight rule's threshold, in units of the graph's median total edge
+# weight, or 0 for "no weight rule -- the partition decides".
+#
+# **Shipped at 0**, and it costs nothing to give up.  Swept over the ten
+# curated sets on the uncapped TF-IDF cosine graph module 2 used to build, at
+# `--reject-min-size 5`, with the mean unplaced count per sample -- so the
+# table says which direction the rule pulled and not what it is worth against
+# today's kernel, which has not been measured:
+#
+#     REJECT_FRAC = 0.00   ARI 0.8527   worst 0.7446   mean k 80.9    2 unplaced
+#     REJECT_FRAC = 0.25   ARI 0.8544   worst 0.7466   mean k 80.2   12 unplaced
+#     REJECT_FRAC = 0.45   ARI 0.8456   worst 0.7334   mean k 79.7   38 unplaced
+#     REJECT_FRAC = 0.50   ARI 0.8342   worst 0.7178   mean k 79.2   58 unplaced
+#
+# 0.45 was the peak of a flat 0.42-0.46 band when it was swept, and that sweep
+# ran against a graph that capped every node at eight edges.  No such cap has
+# existed since, so the strength distribution this rule cuts is a different
+# distribution and 0.45 has fallen off the far side of its own peak: it is
+# worth -0.009 of ARI against the curve's best and -0.007 against not running
+# the rule at all.  Turning it off is not a concession -- 0 is the second-best
+# point on the curve, and it is the only point on the curve that is not a
+# number somebody chose.
+#
+# What is given up is real all the same.  Total edge weight separates the reads
+# a curator refused to group at AUC 0.973, where cluster size does so at
+# 0.25-0.69.  At 0.45 the rule unplaced 38 reads a sample; what is left
+# unplaces 2.  So "nowhere" is still an answer this module can give and it is
+# now the partition that gives it, but it is given about twenty times less
+# often, and `--reject-min-size` is the flag that would have to carry it --
+# over 1 to 10 that flag spans 0.0002 of ARI and cannot.
+REJECT_FRAC = 0.0
 
 
 def seed_all(seed):
@@ -150,9 +189,10 @@ def total_weight(g):
 def weak_mask(g, frac):
     """Vertices whose total edge weight is below `frac` x the graph's median.
 
-    RELATIVE TO THE MEDIAN, not absolute.  An absolute cut in cosine-weight
-    units is a different cut on every graph -- `--edge-k` alone moves the
-    median by a factor of three -- and would not survive being carried to a new
+    RELATIVE TO THE MEDIAN, not absolute.  An absolute cut in kernel-weight
+    units is a different cut on every graph -- the per-node edge count alone
+    moves the median by a factor of three -- and would not survive being
+    carried to a new
     sample, which is the one place a reject rule has to work unsupervised.
     `frac = 0` rejects nothing.
     """
@@ -239,21 +279,21 @@ def _summarise(g, name, mem, why, dt):
                       modularity=q, seconds=dt)
 
 
-def run(G, *, seed=0, reject_frac=0.35, reject_min_size=5):
+def run(G, *, seed=0, reject_min_size=5):
     """Module 3 end to end.  Returns one `Assignment`."""
     import time
     g = G.g
     if g.vcount() == 0:
         raise SystemExit("cluster: the graph has no vertices")
     log(f"cluster: {METHOD} on {g.vcount():,} vertices, seed {seed}")
-    weak = int(weak_mask(g, reject_frac).sum())
-    if reject_frac > 0:
-        log(f"cluster: {weak:,} reads are under {reject_frac:g} x the median "
+    if REJECT_FRAC > 0:
+        weak = int(weak_mask(g, REJECT_FRAC).sum())
+        log(f"cluster: {weak:,} reads are under {REJECT_FRAC:g} x the median "
             f"total edge weight and are unplaced")
 
     t0 = time.time()
     mem = cluster(g)
-    mem, why = reject(g, mem, reject_frac, reject_min_size)
+    mem, why = reject(g, mem, REJECT_FRAC, reject_min_size)
     a = _summarise(g, METHOD, mem, why, time.time() - t0)
     tally = collections.Counter(w for w in why if w)
     log(f"cluster: {a.n_clusters:>5,} clusters  {a.n_unclustered:>4,} "

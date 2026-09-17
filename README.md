@@ -12,7 +12,7 @@ Three modules and one command:
 | | module | what it does |
 |---|---|---|
 | 1 | `trc/intake.py` | FASTQ or BAM → reads put on the C strand by teloBP's own strand call, with the array/subtelomere boundary called by teloBP |
-| 2 | `trc/graph.py` | reads → an `igraph.Graph`: a TF-IDF cosine over the k-mers of one window across the boundary, kept at the top `--edge-k` per node |
+| 2 | `trc/graph.py` | reads → an `igraph.Graph`: a TF-IDF cosine over the k-mers of one window across the boundary, kept where each read's own neighbourhood gate leaves them |
 | 3 | `trc/cluster.py` | the graph → clusters, with weakly-attached reads reported `unclustered:<rule>` rather than moved into a neighbour |
 
 `trc/teloboundary.py` is [TeloBP](https://github.com/GEN-DBIO/TeloBP) (MIT, © 2024 Ramin Kahidi), vendored and lightly adapted, so module 1 has nothing to install.
@@ -81,7 +81,7 @@ dropped and what was changed. `--cache` stamps its source alongside
 trc reads.fq.gz -o out/HG08434
 
 # a BAM, a different k
-trc reads.bam -o out/HG08434 -k 30 --edge-k 14
+trc reads.bam -o out/HG08434 -k 30 --telo-bp 2500
 
 # every intermediate, the edge list and run.json, reused by the next run
 trc reads.fq.gz -o out/HG08434 --cache out/HG08434/cache
@@ -111,7 +111,7 @@ the read. The reasons are, in the order a read reaches them:
 | `cluster` | from | the read |
 |---|---|---|
 | `0`, `1`, … | `cluster.py` | was placed in that cluster |
-| `unclustered:weak_edges` | `cluster.py` | had total edge weight under `--reject-frac` × the graph's median |
+| `unclustered:weak_edges` | `cluster.py` | had total edge weight under `cluster.REJECT_FRAC` × the graph's median. That constant is 0, so this reason no longer fires |
 | `unclustered:small_cluster` | `cluster.py` | was in a cluster left under `--reject-min-size` |
 | `unclustered:no_kmers` | `graph.py` | had no informative k-mer, so it was held out of the graph |
 | `unclustered:short_sub` | `intake.py` | had under `--min-subtelo-bp` of subtelomere past the boundary |
@@ -196,7 +196,7 @@ downstream by the IDF, because everything that reached it has one.
 ```
 v_i[m] = log1p(tf_i[m]) * idf[m]       idf[m] = log(n / df[m])
 w_ij   = <v_i, v_j> / (||v_i|| ||v_j||)
-edges  = the top `edge_k` weights at each node, symmetric union
+edges  = every pair the natural-neighbourhood gate leaves standing
 ```
 
 **Order is discarded.** A k-mer is an edge because both reads contain it, full
@@ -209,22 +209,33 @@ algorithms were measured to cut identically.
 become hubs on length alone. L2-normalising first asks about composition
 instead.
 
-**Top-k per node, not a weight threshold.** A single weight cut keeps hundreds
-of edges at a dense node and none at a sparse one, encoding the density rather
-than the structure.
+**The edge rule is a gate, not a threshold and no longer a count.** A single
+weight cut keeps hundreds of edges at a dense node and none at a sparse one,
+encoding the density rather than the structure, so each read's neighbourhood is
+read off the largest drop in its *own* sorted similarity profile and a pair
+survives when either read calls the other a neighbour. The per-node cap that
+used to follow it is `graph.EDGE_K`, a constant, and it is 0 — there is no cap.
+What that costs is measured in `graph.py`, beside the constant: it is the
+largest single effect in module 2.
 
-**The two df gates cut either end of the range.** `--min-k-n` removes a k-mer
-in one read, which cannot form an edge at all. `--max-k-frac` removes what most
-of the pool shares — at the default 0.5, a k-mer in more than half the reads.
-The canonical repeat was already cheap without it: `log1p(tf)` and `log(n/df)`
-between them put it at ~0.3% of a read's vector before any gate sees it. What
-is left is the middle, where a chromosome end's identity lives.
+**The vocabulary is every k-mer the pool contains.** The two df gates that
+used to cut either end of the range are `graph.MIN_K_N` and `graph.MAX_K_FRAC`,
+constants, and both are at their inert value — so the only column dropped is one
+every read carries, whose `log(n/df)` is exactly 0 and which could not move a
+cosine anyway. The canonical repeat was always cheap without a gate: `log1p(tf)`
+and `log(n/df)` between them put it at ~0.3% of a read's vector.
 
-The ceiling is a fraction of **the pool, not of a group**, so it has to stay
-above the largest group's share of the reads. At 0.5, a cluster holding more
-than half the sample loses the k-mers that define it. That is not a concern at
-the ninety-odd ends of a whole-sample run; it is one on a pool pre-filtered to
-a few arms, where the ceiling should be raised toward 1.0.
+`graph.py` carries the 2×2 that measures them. The floor is what the choice
+costs — admitting the singletons triples the vocabulary and puts each read's
+private sequence, which at these depths is very largely basecall error, into its
+own L2 norm. The ceiling turns out to have been the opposite: it was documented
+as inert and is not, because it was deleting ~10% of every read's incidences
+(the columns most reads share) and keeping those is worth +0.025 ARI.
+
+What the ceiling was *for* is now unguarded. It is a fraction of **the pool, not
+of a group**, so on a pool pre-filtered to a few arms one group can be half the
+reads and a ceiling of 0.5 deletes exactly the k-mers that name it. At 1.0
+nothing can.
 
 ### 3. Cluster assignment
 
@@ -241,22 +252,35 @@ is the answer, which is not available at run time. Nothing in these three
 modules reads a label of any kind.
 
 **"Nowhere" is an answer this pipeline is allowed to give.** A read is reported
-`unclustered:weak_edges` when its total edge weight is under `--reject-frac` ×
-the graph's median, and `unclustered:small_cluster` when what is left of its
-cluster is under `--reject-min-size`. A read that trips both is
-`weak_edges` — the weight rule runs first, and by the time the size floor is
-applied the read has already gone. Nothing is ever moved into a neighbouring
-cluster.
+`unclustered:small_cluster` when what is left of its cluster is under
+`--reject-min-size`. Nothing is ever moved into a neighbouring cluster.
 
-The weight rule is the one that does the work. Total edge weight separates the
-reads a curator refused to group at AUC 0.973; cluster size does so at
-0.25–0.69, at or below a coin flip, because most such reads sit *inside* real
-thirty-read groups. Degree cannot work and could not: top-k gives every node
-`edge_k` neighbours by construction, so degree is floored and carries almost
-nothing. It is the *weight* on those edges that says a read is attached to
-nothing in particular. The threshold is computed on the graph before the
-clustering runs, so it is a statement about the read and not about the
-partition.
+That rule reads the **partition**, not the graph: a read is unplaced because
+Leiden left it by itself or in a group too small to be a chromosome end. A
+second rule used to run before it — `--reject-frac`, which unplaced a read
+whose total edge weight fell under a fraction of the graph's median — and it is
+gone, because what it needed was a number and the number had no source in the
+reads. It survives as `cluster.REJECT_FRAC`, a constant, at 0.
+
+The weight rule was the one that did the work, and what it did is worth
+recording since the size floor now has to do it alone. Total edge weight
+separates the reads a curator refused to group at AUC 0.973; cluster size does
+so at 0.25–0.69, at or below a coin flip, because most such reads sit *inside*
+real thirty-read groups. Degree could not work while the per-node cap was in
+place: it floored degree by construction and left it carrying almost nothing.
+With `graph.EDGE_K = 0` degree varies again and has not been re-measured.
+
+Turning the weight rule off **gains** ARI on today's graph, which is the reason
+it could go without an argument about it. Over the ten curated sets at
+`--reject-min-size 5`, 0.45 scores 0.846 (worst 0.733, 80 clusters, 38 reads
+unplaced a sample) and 0 scores **0.853** (worst 0.745, 81 clusters, 2
+unplaced). The curve peaks at 0.25 (0.854) — 0.45 was the peak of a flat
+0.42–0.46 band when it was swept, but that sweep ran against a graph capped at
+eight edges a node, and on the uncapped graph 0.45 has fallen off the far side.
+0 is the second-best point on the curve and the only one that is not a number
+somebody chose. What it costs is coverage of the rejection question, not
+accuracy: this pipeline now says "nowhere" about twenty times less often, and
+`--reject-min-size` cannot take that up — over 1 to 10 it spans 0.0002 of ARI.
 
 ## Defaults
 
@@ -274,26 +298,31 @@ give identical scores to five decimals — so the uncertainty is entirely
 cross-sample. Seven of the eight samples improve; HG08435.PBMC-ONT-LSK does
 not, splitting into 93 clusters where the curator drew 92.
 
-Two of these parameters were measured to do **nothing** on a whole-sample pool
-and are kept only for the pre-filtered case: see `--max-k-frac` and
-`--reject-min-size` below.
+One of these parameters was measured to do **nothing** on a whole-sample pool
+and is kept because it is now the only rejection rule there is rather than for
+its effect: see `--reject-min-size` below.
+
+**Modules 2 and 3 have since moved off the point that sweep selected**, and
+these numbers are the sweep's. `-k` is 48 rather than 32; the per-node edge cap
+is gone (`graph.EDGE_K = 0`); both df gates are off (`graph.MIN_K_N = 1`,
+`graph.MAX_K_FRAC = 1.0`); the weight-rejection rule is off
+(`cluster.REJECT_FRAC = 0`). End to end over the ten curated sets in
+`out/manually-curated-truth-sets`, that configuration scores ARI **0.853**
+(worst 0.745) and finds 81 clusters where the curators drew 92. Each constant
+records its own cost beside itself, in `graph.py` and `cluster.py`.
 
 | flag | default | why |
 |---|---|---|
-| `-k` | 32 | the largest exact, collision-free length; 33–51 are 64-bit hashes and are labelled as such in `run.json`. Scores flat from 28 to 36 |
+| `-k` | 48 | 33–51 are 64-bit hashes, not exact codes, and are labelled as such in `run.json`; 32 is the largest exact, collision-free length. 48 over 32 is worth 0.003 ARI on the curated sets and is the largest weighting effect measured in module 2 — everything that beat the plain cosine did so by reading more sequence per feature |
 | `--telo-bp` | 3000 | bounds the deepest pair, so a pooled window is a comparable depth of array against a comparable depth of subtelomere. The window always spans both sides of the boundary, `[b0-telo_bp, b0+sub_bp)`, which is the only way to see the k-mers straddling it |
 | `--sub-bp` | 600 | the selected value sits in a flat band from 450 to 600; below 400 the profile loses the subtelomere that identifies the arm |
-| `--edge-k` | 8 | **a counting bound, not a tuning knob**: a read in a group of *m* reads has only *m*−1 possible in-group partners, so `edge_k ≥ m` forces it to link outside its own group. Set against curated groups as small as 11 reads. At 20 the score collapses to 0.92, which is the bound asserting itself |
 | `--min-qs` | 20 | the basecaller's own mean qscore, from the `qs` tag |
 | `--min-telo-bp` | 400 | bases of the oriented read matching `--telo-regex`. A composition test, not the length of anything contiguous |
 | `--min-subtelo-bp` | 1000 | pinned to `--sub-bp`, so a read reaching the graph can fill the subtelomere window instead of merely clearing it. 150 bp was the lossless point across five curated samples, the shortest subtelomere on any *grouped* read there being 151 bp |
 | `--telo-regex` | teloBP's C-strand pattern | a first pass at the two length gates, from composition alone and before the boundary is called, so a hopeless read does not cost teloBP's ~280 ms. Empty turns it off |
 | `--bound-margin` | 5000 | how far past the array teloBP's boundary scan may look. Bounding it is the whole reason for the `itsfix` fork; widening it gives a nearby ITS more room to capture the call |
 | `--snap-bp` | 500 | the boundary is the origin every read is measured from, and teloBP calls it from a 750 bp smoothed window, so it carries that smoothing as slop. Snapping moves it onto the end of the last run of `--telo-regex` — a landmark the reads *share*, since it is the pattern the whole pool is judged by. Measured on HG08434 LCL-ONT-UL, per-column agreement across the 300 bp of array behind `b0` with the clusters held fixed: **0.859** unsnapped, 0.959 onto the last tandem run end (what this used to do), **0.964** onto the last regex run end. It fires on 81% of reads and moves `b0` by a median of 6 bp (p90 105); 76 of 92 clusters improve, the worst loses 0.027. The score saturates by 250 — every value from there to 600 gives the same tables on this sample, since a run end further than that from the call is rare — so 500 is headroom rather than a fitted number. 0 is off, and so is an empty `--telo-regex` |
-| `--reject-frac` | 0.45 | the peak of a flat 0.42–0.46 band, and the one swept parameter that peaks rather than plateaus. It sits deep in the tail because the tail is narrow: total edge weight has a median that varies 0.4% across samples but a low-tail width that varies 13%, so a cut in units of the median lands at a different depth on every sample. See `benchmark/parameterization/README.md` |
-| `--reject-min-size` | 5 | **near-inert**: 1 through 10 span 0.00006 ARI. Cluster size separates the reads a curator refused to group at AUC 0.25–0.69, at or below a coin flip, because most such reads sit inside real thirty-read groups. Left at 5 rather than moved on a difference this small |
-| `--min-k-n` | 3 | below 2 a k-mer cannot form an edge; 3 drops the singleton-pair k-mers that link two reads by a shared error. 2–4 score alike |
-| `--max-k-frac` | 0.5 | drops what more than half the pool shares. **Inert on a whole-sample run**: every value from 0.2 to 1.0 gives byte-identical tables, because ~92 groups of ~30 reads put the largest at ~2% of the pool and the ceiling never binds. It is the right guard only on a pool pre-filtered to a few arms, where a group can be half the reads — raise it toward 1.0 there. Below 0.1 it deletes real signal |
+| `--reject-min-size` | 5 | **near-inert**: over the ten curated sets, 1 through 10 span 0.0002 ARI, and all it moves is the cluster count — 81.6 at 1, 80.2 at 10, against a truth of 92, so raising it walks away from the answer. Cluster size separates the reads a curator refused to group at AUC 0.25–0.69, at or below a coin flip, because most such reads sit inside real thirty-read groups. Left at 5 rather than moved on a difference this small, and it is now the only rejection rule there is |
 
 ## Caching
 
@@ -321,13 +350,16 @@ actually reads, **and a hash of the source of the modules that produce it** — 
 editing a function without touching any constant still invalidates it. There is
 no cache to clear by hand.
 
-They are stamped separately because different flags move them: `--min-k-n` and
-`--max-k-frac` move the matrices and the cosine and leave the database alone,
-and `--edge-k` and everything in module 3 move none of them. So a re-run that
-only changes the clusterer reuses everything.
+They are stamped alike and stored apart, because they cost different things
+to rebuild and to store: the cosine is the expensive half of the module and the
+smallest file. Nothing between the database and the cosine takes a flag any
+more — the df gates are constants, and a change to either is a change to the
+module's source hash, which every one of the three stamps holds. Everything in
+module 3 moves none of them, so a re-run that only changes the clusterer reuses
+everything.
 
-Every field that moves a file is in the *filename* as well as the stamp — the
-window for all of them, and the two df gates for those the gates move. Two
+Every field that moves a file is in the *filename* as well as the stamp: the
+window, for all of them. Two
 builds sharing a file take turns overwriting it, each finding the other's stamp
 wrong and rebuilding, so a sweep alternating between them pays for every build
 twice and never hits the cache.
