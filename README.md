@@ -107,7 +107,7 @@ read_id  cluster  strength  degree  n_informative_kmers
 
 The first ten columns are fixed. The eleventh is module 3's own per-read
 number, under the name that module gives it — `cohesion`, the share of the
-read's edge weight that stays inside its cluster — and the browser discovers
+edge weight the read *chose* that stays inside its cluster — and the browser discovers
 it as whatever column is not one of the ten rather than being told which
 module 3 wrote the table.
 
@@ -152,7 +152,12 @@ where there is no strength to rank by.
 `-o` holds the answer and nothing else. Everything describing *how* a run
 reached it goes to `--cache DIR`, and without that flag is not written at all:
 
-- **`<DIR>/<sample>.edges.tsv`**: `read_i read_j weight n_shared idf_shared`
+- **`<DIR>/<sample>.edges.tsv`**: `read_i read_j weight n_shared idf_shared
+  chose`, where `chose` is `both`, `i` or `j` — which end asked for the edge.
+  Step 3 weights each read's own `--n-neighbors` nearest and nothing else, so
+  an edge is one-way whenever the read at the other end had ten better
+  options. On the curated sample **75.3% of the 20,038 edges are one-way**, and
+  module 3's refusal reads the same distinction.
 - **`<DIR>/<sample>.run.json`**: every parameter, the intake reject tally, the
   pair-weight distribution, and the cluster summary
 
@@ -200,10 +205,24 @@ downstream by the IDF, because everything that reached it has one.
 ### 2. The graph
 
 ```
-v_i[m] = log1p(tf_i[m]) * idf[m]       idf[m] = log(n / df[m])
-w_ij   = <v_i, v_j> / (||v_i|| ||v_j||)
-edges  = every pair the natural-neighbourhood gate leaves standing
+1 normalise  v_i[m] = log1p(tf_i[m]) * idf[m]     idf[m] = log(n / df[m])
+2 distance   d(i,j) = || v_i - v_j ||             rows NOT unit length
+3 weight     w(i->j) = exp(-(d(i,j) - rho_i) / sigma_i)   over i's 10 nearest
+4 refine     w(i,j) = r(a + b - ab) + (1 - r)ab   a = w(i->j), b = w(j->i)
 ```
+
+Step 1 is textbook TF-IDF, a **product** of two compressed quantities. It was
+`log1p(tf * e^idf)` until the measurement in `graph.py` — which folds the raw
+ratio `n/df` inside the log and comes out as `log(tf) + idf`, a **sum**, and a
+much weaker weighting: a canonical repeat column reads 5.94 that way against
+1.33 as a product. The sum form wins if module 3 cuts once; the product wins
+once it cuts repeatedly, and neither change survives being tested alone.
+
+`rho_i` is read i's nearest distance, subtracted so that neighbour sits at
+weight 1; `sigma_i` is solved so each read's outgoing weight sums to
+`log2(--n-neighbors)`, which is what stops a read in a dense arm outvoting one
+in a sparse arm. `--n-neighbors` is the only cut in module 2 and it is a cut on
+**count**, never on weight.
 
 **Order is discarded.** A k-mer is an edge because both reads contain it, full
 stop — no chaining, no positional agreement. That is a choice, not a
@@ -263,11 +282,27 @@ read run after it, and nothing is ever moved into a neighbouring cluster:
 
 | reason | what it reads |
 |---|---|
-| `unclustered:disputed` | the **graph**, against the partition: under `cluster.MIN_COHESION` of the read's edge weight lies inside the cluster Leiden put it in |
+| `unclustered:disputed` | the **graph**, against the partition: under `cluster.MIN_COHESION` of the edge weight the read *chose* lies inside the cluster Leiden put it in |
 | `unclustered:small_cluster` | the **partition**: what is left of the read's cluster is under `--reject-min-size` |
 
 In that order, so the size floor is applied to the clusters that remain after
 the disputed reads leave.
+
+**And the cut is repeated.** A refusal that arrives after the cut arrives too
+late: Leiden has already used a bridging read to merge two chromosome ends by
+the time `cohesion` says it belongs to neither, so the rule catches the read
+and keeps the damage. `cluster.PASSES = 16` times, the refused reads are
+*deleted* — the vertex, and its edges with it — and what remains is cut again.
+On the curated sample all fourteen reads joining curated 47 to curated 62 were
+already refused; cutting again without them splits the pair, lands the cluster
+count on the curated 92 and takes ARI from 0.9862 to **0.9991**.
+
+Pass 1 refuses 17 and pass 2 refuses nobody, and passes 3 to 32 return the same
+partition every time from a different RNG start — the same stability the ECG
+work ran into, where sixteen bootstrapped Leidens matched a single one. So the
+spare passes cost ~2s and buy nothing measurable *here*; they are run because
+the graph that needs them is the one whose structure is less settled, and that
+has not been ruled out on the other nine samples.
 
 `cohesion` is that share, and it is **weighted**, which is the whole of the
 rule. A read on the boundary between two real clusters has edges leaving it,
@@ -279,16 +314,28 @@ whose placement nothing ever doubted, and weighing them the same reads read
 which floors every read's strength however empty its neighbourhood is, so a
 level-based rule has nothing left to cut. A share is unaffected by that floor.
 
+**The denominator is what the read chose, not what chose it.** Three quarters
+of the edges here are one-way, so a read can collect a large share of its
+incident weight from reads that picked *it* — and under the first version of
+this rule it was refused for their sake. `09480b4c` is the case that named it:
+47.8% of its incident weight came from reads that chose it, among them one the
+curator marked `weak_edges` and one marked `no_kmers`, dragging it to 0.679 and
+out of a cluster Leiden had placed it in correctly. Over its own ten choices it
+reads 1.0000. A read answers for where it points; it does not answer for who
+points at it.
+
 On **one** sample — HG08434.LCL-ONT-UL, 2,523 graph reads the curators sorted
 into 92 clusters while refusing 12, at `--reject-min-size 5`:
 
-| rule | k | unplaced | ARI | shattered | merged | refused caught |
-|---|---|---|---|---|---|---|
-| no refusal | 92 | 0 | 0.9962 | 3 | 2 | 0/12 |
-| `cohesion < 0.99` | 92 | 19 | **0.9972** | 2 | 2 | **12/12** |
+| rule | k | unplaced | ARI | shattered | merged | refused caught | precision |
+|---|---|---|---|---|---|---|---|
+| no refusal | 92 | 0 | 0.9962 | 3 | 2 | 0/12 | — |
+| `cohesion < 0.99`, all incident edges | 92 | 19 | **0.9972** | 2 | 2 | **12/12** | 0.63 |
+| `cohesion < 0.99`, edges the read chose | 92 | 14 | **0.9972** | 2 | 2 | **12/12** | **0.86** |
 
-All twelve, at a precision of 0.63, and cohesion ranks the refused reads
-against the rest at **AUC 0.998** — where total edge weight reaches 0.973 and
+All twelve under either denominator; over a read's own choices the five false
+refusals go away and cohesion ranks the refused reads against the rest at
+**AUC 0.999** — where total edge weight reaches 0.973 and
 cluster size 0.25–0.69, at or below a coin flip, because most refused reads sit
 *inside* real thirty-read groups. Degree has never been a usable signal either,
 though for a reason that has since gone away: the per-node edge cap floored it

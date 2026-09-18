@@ -6,7 +6,7 @@
 FOUR STEPS, one function each, and nothing else stands between the k-mer
 matrix and the graph module 3 cuts:
 
-    1  normalise   v_i[m] = log1p(tf_i[m] * e^idf[m])          `vectors`
+    1  normalise   v_i[m] = log1p(tf_i[m]) * idf[m]            `vectors`
                    idf[m] = log(n / df[m])
     2  distance    d(i,j) = || v_i - v_j ||                    `distances`
     3  weight      w(i->j) = exp(-(d(i,j) - rho_i) / sigma_i)  `weights`
@@ -86,6 +86,81 @@ question rather than the old one rewritten.  What it costs is that a long
 read sits further from everything, which step 3 answers per read: a long
 read's rho and sigma are ITS OWN, so its neighbours are still read off its
 own profile and not off a scale set by the pool.
+
+**IT COSTS SOMETHING ELSE TOO, AND NORMALISING IS STILL THE WRONG TRADE.**
+Since `d^2 = ||a||^2 + ||b||^2 - 2<a,b>`, a pair sharing almost nothing has
+`<a,b> ~= 0` and sits at `d ~= sqrt(||a||^2 + ||b||^2)` -- so among reads it
+does not resemble, a read's NEAREST are simply the ones with the SMALLEST
+NORMS.  On HG08434.LCL-ONT-UL that misplaces a near-duplicate pair of curated
+cluster 32 (`a1a792f6`, `7c40d27d`, arrays of ~2 kb where their cluster-mates
+run 6.6-9.5 kb).  Their 33 mates share 381-1,518 k-mers with them and sit at
+distance ranks 417, 441, 452 ... median 1,137 OF 2,523; the nine reads that
+take the rest of their log2(k) budget, and carry them into the wrong cluster,
+share 6 to 13 k-mers whose summed IDF is 0.0 -- canonical repeat and nothing
+else.
+
+WHICH FORM IS BEST DEPENDS ON MODULE 3, which is why this table has two
+halves.  Seven step-1 forms, everything else shipped, scored on the partition
+against the curated labels of HG08434.LCL-ONT-UL.  `one cut` is module 3
+cutting once and refusing afterwards; `settled` is `cut_until_settled`, which
+deletes the refused reads and cuts again until a pass refuses nobody.
+
+                                   ONE CUT                  SETTLED
+    step 1                     k  unpl     ARI  caught   k  unpl     ARI  caught
+    log1p(tf) * idf   raw     91    17  0.9862  12/12   92    17  0.9991  12/12  SHIPS
+    log1p(tf e^idf)   raw     92    14  0.9972  12/12   92    14  0.9972  12/12
+    log1p(tf)         raw      -     -       -      -   93    15  0.9954  12/12
+    log1p(tf) * idf   unit    91     9  0.9856   5/12   91     9  0.9856   5/12
+    log1p(tf e^idf)   unit    91     8  0.9852   5/12   91     8  0.9852   5/12
+    presence          unit    90    13  0.9763   3/12   90    13  0.9763   3/12
+    log1p(tf)         unit    89    10  0.9339   3/12   90    12  0.9700   3/12
+
+**THE TWO CHANGES ONLY WIN TOGETHER.**  Under one cut the sum form leads by
+0.011 and traditional TF-IDF looks like a regression that fuses curated 27, 47
+and 62.  But every read joining 47 to 62 was ALREADY REFUSED -- all fourteen of
+them -- so the fusion was held together entirely by reads module 3 throws away
+a moment too late.  Cut again without them and it splits, the cluster count
+lands on the curated 92, and ARI goes 0.9862 -> 0.9991, the best measured on
+this sample.  Neither change would have survived being tested alone.
+
+Every UNIT row fuses two curated clusters and the second cut does not save
+them, because what fuses them is not a refused read: `a1a792f6` rejoins curated
+32 there because curated 32 has absorbed curated 41.  Nothing shattered
+afterwards because nothing was left apart to shatter, and the refusal goes with
+it -- once two ends are one cluster a bridging read's weight is all internal,
+it reads cohesion 1.0, and the rule that catches 12 of 12 catches 3 to 5.
+
+`log1p(tf)` on raw rows is the one worth remembering: settled, it is the only
+form with NO fused cluster at all and it still catches 12 of 12, but it cuts
+93 clusters where the curators drew 92.  It trades 0.004 of ARI and one extra
+split for never merging two ends.
+
+MEASURED WITH `benchmark/row-normalisation/sweep.py` AND CONFIRMED BY A FULL
+`python -m trc` RUN PER ROW, except the `log1p(tf)` raw row, which has the
+harness only.  Seeding matters: igraph's Leiden draws from Python's `random`
+and `cluster.run` does not seed it, so a harness that skips `main.seed_all`
+does not reproduce a pipeline run -- and must reseed before EVERY variant, not
+once, because each Leiden consumes the state.
+
+A WARNING ABOUT HOW THAT WAS NEARLY MISSED.  Unit rows were chosen on `p@10`,
+the share of a read's ten nearest carrying its curated label, which reads
+0.9982 unnormalised and 0.9997-1.0000 normalised -- it saturates, and it can
+only see a read's own neighbourhood where Leiden reads the whole graph.  A
+step-1 change is not answerable on a neighbourhood measure; take it to a
+partition.  `benchmark/row-normalisation/sweep.py` is that harness.
+
+AND THE RARE K-MERS ARE NOT THE PROBLEM, which is worth writing down because
+they are the obvious suspect: 67.7% of the columns here are in exactly ONE
+read, and dropping them changes the unnormalised metric not at all (p@10
+0.9982 -> 0.9979, the pair still misplaced) and makes every normalised variant
+worse.  A private k-mer costs a row a little mass and nothing else.
+
+What the pair actually needs is not in this module.  Their window is
+`[b0-3000, b0+600)` over a ~2 kb array, so it covers their whole array plus 600
+bp of subtelomere, while a mate with a 7.5 kb array covers the 3 kb of array
+NEAREST the boundary plus the same 600 bp.  The 556 k-mers they do share are
+that subtelomere -- the real signal, drowned by two non-overlapping stretches
+of array.  That is the window, not the metric and not the kernel.
 
 **Reads with no informative k-mer are not vertices.**  A read scanned into a
 window with nothing informative in it has an all-zero vector, so it is at the
@@ -405,16 +480,19 @@ class Vectors:
 
         X = counts          raw occurrences of each informative k-mer
         L = log1p(X)        sublinear term frequency, without the idf
-        V = log1p(X e^idf)  step 1's output -- the rows step 2 measures
+        V = log1p(X) * idf  step 1's output -- the rows step 2 measures
                             between, NOT normalised to unit length
         B = X > 0           presence only, which `n_shared` is counted in
 
-    The idf enters INSIDE the `log1p` and not as a factor outside it, so a
-    column's value is `log1p(tf * e^idf)` rather than `log1p(tf) * idf`.  The
-    two agree on which columns are worth anything and differ in how hard they
-    compress a large count of a rare k-mer; this is the form that has been
-    measured on the curated sets, so it is the one kept while step 1 is the
-    step still open to change.
+    **This is textbook TF-IDF: a PRODUCT of two compressed quantities.**  It
+    was not always.  The module used to write `log1p(tf * e^idf)`, folding the
+    raw ratio `e^idf = n/df` inside the log, which for any term that is present
+    comes out as `log(tf) + idf` -- a SUM, an additive per-column offset.  That
+    is much the weaker weighting: at n = 2,523 a canonical repeat column
+    (df = 2000, tf = 300) reads 5.94 under the sum and 1.33 under the product,
+    and private-to-canonical falls from 4.1x to 1.3x.  The module docstring
+    carries what each is worth, and why the answer flipped once module 3
+    learned to cut twice.
     """
     indptr: np.ndarray          # int64, length n + 1
     indices: np.ndarray         # int32, the column of every entry
@@ -502,8 +580,10 @@ def vectors(db, keep, idf):
     X = sparse.csr_matrix((dat.astype(np.float32), idx.astype(np.int32),
                            indptr), shape=(n, ncol))
     L = _transform(X)
-    V = _transform(sparse.csr_matrix(
-        X @ sparse.diags(np.exp(idf).astype(np.float32))))
+    # `keep` admits only `w > 0`, so every idf here is strictly positive and
+    # this diagonal cannot zero an entry -- which is what lets all four value
+    # vectors share one sparsity structure.  The check below holds it to that.
+    V = sparse.csr_matrix(L @ sparse.diags(idf.astype(np.float32)))
     V.sort_indices()
     # Checked and not assumed, because one structure for four value vectors is
     # the whole basis of `Vectors` and of what the cache writes.
@@ -793,8 +873,14 @@ def refine(W, ratio=MIX_RATIO):
 
 
 # ----------------------------------------------------------------- the edges
-def edge_list(W, ok):
-    """Every positively weighted pair, as `(pairs, weights)`, strongest first.
+def edge_list(W, ok, claim=None):
+    """Every positively weighted pair, `(pairs, weights, claims)`, strongest first.
+
+    `claims[e]` is `(did pairs[e,0] choose this edge, did pairs[e,1])`.  Step 3
+    gave a weight only to each read's own `n_neighbors` nearest, so an edge can
+    reach a read that never asked for it -- and module 3 has to be able to tell
+    the two apart, because a read cannot be held responsible for who chose IT.
+    With `claim` left out every edge reads as chosen by both ends.
 
     One row per undirected edge.  There is no per-node cap and no weight
     threshold here: `W` is already sparse because step 3 gave a weight only to
@@ -812,14 +898,22 @@ def edge_list(W, ok):
     """
     idx = np.flatnonzero(ok)
     if idx.size < 2:
-        return np.empty((0, 2), np.int64), np.empty(0, np.float64)
+        return (np.empty((0, 2), np.int64), np.empty(0, np.float64),
+                np.empty((0, 2), bool))
     sub = np.array(W[np.ix_(idx, idx)], np.float64, copy=True)
     np.fill_diagonal(sub, 0.0)
     a, b = np.nonzero(np.triu(sub, 1) > 0.0)
     pairs = np.stack([idx[a], idx[b]], axis=1)
     w = sub[a, b]
     order = np.argsort(-w, kind="stable")
-    return pairs[order], w[order]
+    pairs, w = pairs[order], w[order]
+    if claim is None:
+        claims = np.ones((pairs.shape[0], 2), bool)
+    else:
+        claim = np.asarray(claim, bool)
+        claims = np.stack([claim[pairs[:, 0], pairs[:, 1]],
+                           claim[pairs[:, 1], pairs[:, 0]]], axis=1)
+    return pairs, w, claims
 
 
 def shared_detail(B, idf, pairs):
@@ -916,6 +1010,7 @@ class Graph:
     ok: np.ndarray                  # read index -> was it measurable
     pairs: np.ndarray               # (n_edges, 2) read indices
     weights: np.ndarray
+    claims: np.ndarray              # (n_edges, 2) bool, did that end choose it
     n_shared: np.ndarray
     idf_shared: np.ndarray
     strength: np.ndarray            # per read, summed weight to measured reads
@@ -926,8 +1021,13 @@ class Graph:
     report: dict = field(default_factory=dict)
 
 
-def to_igraph(pairs, w, ok, ids):
-    """An `igraph.Graph` over the measured reads.  `(g, vertex_of)`."""
+def to_igraph(pairs, w, ok, ids, claims=None):
+    """An `igraph.Graph` over the measured reads.  `(g, vertex_of)`.
+
+    Carries `weight` and, per edge, the two `claim_i`/`claim_j` flags, in the
+    order the edges were handed in -- which is the order `get_edgelist()`
+    returns them, the same assumption `weight` has always relied on.
+    """
     import igraph as ig
     idx = np.flatnonzero(ok)
     vertex_of = np.full(ok.size, -1, np.int64)
@@ -936,6 +1036,10 @@ def to_igraph(pairs, w, ok, ids):
              for i, j in pairs]
     g = ig.Graph(n=int(idx.size), edges=edges)
     g.es["weight"] = [float(x) for x in w]
+    if claims is None:
+        claims = np.ones((len(edges), 2), bool)
+    g.es["claim_i"] = [bool(x) for x in np.asarray(claims)[:, 0]]
+    g.es["claim_j"] = [bool(x) for x in np.asarray(claims)[:, 1]]
     g.vs["name"] = [ids[int(i)] for i in idx]
     return g, vertex_of
 
@@ -976,19 +1080,24 @@ def build(reads, *, k, telo_bp, sub_bp, n_neighbors, mix_ratio=MIX_RATIO,
             del iu
         W = weights(D, ok, n_neighbors)
         del D
-        log(f"graph: step 4, the two directions mixed at r={mix_ratio:g} "
-            f"({_mix_name(mix_ratio)})")
-        W = refine(W, mix_ratio)
     else:
-        log("graph: reusing the weights")
+        log("graph: reusing the directed weights")
+    # `W` is step 3's ASYMMETRIC matrix all the way to here, and it is what the
+    # caller caches.  Its support is exactly "i chose j", which step 4 destroys
+    # by construction and module 3 needs; keeping the directed form is also why
+    # `--mix-ratio` no longer costs a rebuild of steps 2 and 3.
     W = np.asarray(W, np.float64)
+    claim = W > 0.0
+    log(f"graph: step 4, the two directions mixed at r={mix_ratio:g} "
+        f"({_mix_name(mix_ratio)})")
+    M = refine(W, mix_ratio)
     n_held = int((~ok).sum())
     if n_held:
         log(f"graph: {n_held:,} reads have no informative k-mer and are held "
             f"out of the graph")
-    rep = survey(W, ok)
+    rep = survey(M, ok)
 
-    pairs, w = edge_list(W, ok)
+    pairs, w, claims = edge_list(M, ok, claim)
     ns, gs = shared_detail(B, idf, pairs)
     if len(pairs):
         log(f"graph: {len(pairs):,} edges at {n_neighbors} neighbours per read "
@@ -1001,8 +1110,8 @@ def build(reads, *, k, telo_bp, sub_bp, n_neighbors, mix_ratio=MIX_RATIO,
     # are structurally zero, so excluding them changes no number -- but leaving
     # them in would make the quantity depend on how many unscanned reads the
     # sample happened to contain.
-    m = np.zeros_like(W)
-    m[np.ix_(ok, ok)] = W[np.ix_(ok, ok)]
+    m = np.zeros_like(M)
+    m[np.ix_(ok, ok)] = M[np.ix_(ok, ok)]
     np.fill_diagonal(m, 0.0)
     strength = m.sum(axis=1)
 
@@ -1012,7 +1121,12 @@ def build(reads, *, k, telo_bp, sub_bp, n_neighbors, mix_ratio=MIX_RATIO,
         np.add.at(deg, pairs[:, 1], 1)
 
     ids = [r.read_id for r in reads]
-    g, vertex_of = to_igraph(pairs, w, ok, ids)
+    n_one = int((claims.sum(axis=1) == 1).sum())
+    if len(pairs):
+        log(f"graph: {n_one:,} of {len(pairs):,} edges are one-way "
+            f"({n_one / len(pairs):.1%}) -- one read chose them and the other "
+            f"did not")
+    g, vertex_of = to_igraph(pairs, w, ok, ids, claims)
     log(f"graph: {g.vcount():,} vertices, {g.ecount():,} weighted edges, "
         f"{len(g.connected_components()):,} connected components")
     rep.update({"n_measured": int(ok.sum()), "n_held_out": n_held,
@@ -1021,7 +1135,8 @@ def build(reads, *, k, telo_bp, sub_bp, n_neighbors, mix_ratio=MIX_RATIO,
                 "mix_ratio": float(mix_ratio), "n_vertices": g.vcount(),
                 "n_components": len(g.connected_components())})
     return Graph(g=g, ids=ids, vertex_of=vertex_of, ok=ok, pairs=pairs,
-                 weights=w, n_shared=ns, idf_shared=gs, strength=strength,
+                 weights=w, claims=claims,
+                 n_shared=ns, idf_shared=gs, strength=strength,
                  degree=deg, n_informative=np.asarray(B.getnnz(axis=1),
                                                       np.int64),
                  ncol=int(keep.size), hashed=db.hashed, report=rep), \

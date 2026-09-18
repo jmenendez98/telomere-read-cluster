@@ -21,8 +21,8 @@ Nothing in this module reads a label of any kind.
 `unclustered:<rule>` rather than pulled into the nearest cluster, and two rules
 put it there:
 
-    disputed           under `MIN_COHESION` of its edge weight lies inside the
-                       cluster it was placed in
+    disputed           under `MIN_COHESION` of the edge weight IT CHOSE lies
+                       inside the cluster it was placed in
     --reject-min-size  what is left of its cluster is smaller than this
 
 The second reads the PARTITION.  The first reads the GRAPH against the
@@ -31,13 +31,25 @@ partition is a partition: Leiden labels every vertex and has no way to say
 "nowhere", so every unplaced read this module produces is produced after it.
 
 **A read is unplaced when most of what module 2 measured about it points
-somewhere other than where it was put.**  `cohesion` is that share -- the
-fraction of a read's incident edge weight that stays inside its own cluster --
-and it is WEIGHTED, which is the whole of the rule.  A read at the boundary
-between two real clusters has edges leaving it, but module 2 has already priced
-those edges, and at a real boundary they are worth almost nothing.  Counting
-those edges instead of weighing them is a rule that throws out reads whose
-placement nothing ever doubted; weighing them, the same reads read 0.9999.
+somewhere other than where it was put.**  `cohesion` is that share -- of the
+edge weight the read ITSELF claimed, the fraction that stays inside its own
+cluster -- and it is WEIGHTED, which is the whole of the rule.  A read at the
+boundary between two real clusters has edges leaving it, but module 2 has
+already priced those edges, and at a real boundary they are worth almost
+nothing.  Counting those edges instead of weighing them is a rule that throws
+out reads whose placement nothing ever doubted; weighing them, the same reads
+read 0.9999.
+
+**THE DENOMINATOR IS WHAT THE READ CHOSE, NOT WHAT CHOSE IT.**  Step 3 gives
+each read a weight to its own `n_neighbors` nearest and to nothing else, so an
+edge can arrive at a read that never asked for it -- and a read popular with
+reads that cannot be placed was, under the first version of this rule, refused
+for their sake.  On the curated sample `09480b4c` is the case that named the
+bug: 47.8% of its incident weight came from reads that chose IT, among them one
+the curator marked `weak_edges` and one marked `no_kmers`, which dragged it to
+0.679 and out of a cluster Leiden had put it in correctly.  Over its own ten
+choices it reads 1.0000.  A read answers for where it points.  It does not
+answer for who points at it.
 
 **It is a RATIO, and the reason is the rule it replaces.**  `REJECT_FRAC`
 unplaced a read whose total edge weight fell under a fraction of the graph's
@@ -61,17 +73,21 @@ below, at the constant itself, with the distribution that opened the band.
 2,523 reads that reached the graph and that the curators sorted into 92
 clusters while refusing 12:
 
-    rule               k  unplaced   ARI  shattered  merged  caught
-    no refusal        92         0  0.9962      3       2      0/12
-    cohesion < 0.99   92        19  0.9972      2       2     12/12
+    rule                         k  unplaced   ARI  shattered  merged  caught
+    no refusal                  92         0  0.9962      3       2      0/12
+    cohesion, all edges         92        19  0.9972      2       2     12/12
+    cohesion, chosen edges      92        14  0.9972      2       2     12/12
 
 `shattered` is curated clusters split across more than one found cluster,
 `merged` is found clusters holding more than one curated cluster, `caught` is
 how many of the 12 refused reads this module also refused, and ARI is over the
-reads both the module and the curators placed.  Every one of the 12 is caught,
-at a precision of 0.63, and cohesion ranks the refused reads against the rest
-at AUC 0.998 -- the best refusal signal measured on this graph, where total
-edge weight reaches 0.973 and cluster size 0.25-0.69.
+reads both the module and the curators placed.  Every one of the 12 is caught
+under either denominator; over a read's OWN choices the five false refusals go
+away, precision runs 0.63 -> 0.86, and cohesion ranks the refused reads against
+the rest at AUC 0.999 -- the best refusal signal measured on this graph, where
+total edge weight reaches 0.973 and cluster size 0.25-0.69.  Three of the five
+reads it stops refusing are `09480b4c`, `171c9489` and `aa0c4ee6`, all of
+curated cluster 47, all of which Leiden had placed correctly in found 45.
 
 **Pulling the disputed reads out makes the partition better, not just
 smaller.**  One of the three curated clusters the partition used to shatter was
@@ -185,28 +201,34 @@ SCORE_COL = "cohesion"
 # (HG08434.LCL-ONT-UL, 2,523 graph reads) the whole distribution of cohesion
 # is four groups and two gaps:
 #
-#     19 reads    0.5367 to 0.9655
-#     ---------   nothing at all across 0.0343 of the range
-#      8 reads    0.999875 to 0.999999
+#     14 reads    0.5367 to 0.9481
+#     ---------   nothing at all across 0.0518 of the range
+#      2 reads    0.999875 to 0.999999
 #     ---------
-#  2,496 reads    exactly 1
+#  2,507 reads    exactly 1
 #
-# Every cut in (0.9655, 0.9998] therefore returns the same 19 reads, and all
+# Every cut in (0.9481, 0.9998] therefore returns the same 14 reads, and all
 # 12 of the reads a curator refused to group are among them at every one:
 #
-#     cut     0.950  0.960  0.970  0.980  0.990  0.999
-#     rejects    18     18     19     19     19     19
+#     cut     0.970  0.980  0.990  0.995  0.999  0.9999
+#     rejects    14     14     14     14     14     15
 #     caught     12     12     12     12     12     12   (of 12)
 #
 # So this is not the peak of a swept curve -- which is what `REJECT_FRAC` was,
 # and why it is gone -- it is a point inside a gap the distribution itself
-# opened, with nothing within 0.024 below it or 0.0098 above it, and nothing
+# opened, with nothing within 0.042 below it or 0.0099 above it, and nothing
 # was fitted to choose it.
 #
-# WHAT IT MUST NOT BE IS 1.  The 8 reads just under 1 are there because a
+# THE DENOMINATOR WIDENED THE BAND.  Counting only the edges a read chose, the
+# gap grew from 0.0343 to 0.0518 and the dust just under 1 fell from 8 reads to
+# 2, because most of what used to sit between 0.9481 and 1 was a read being
+# charged for an edge somebody else asked for.  The constant did not move; the
+# room around it roughly doubled.
+#
+# WHAT IT MUST NOT BE IS 1.  The 2 reads just under 1 are there because a
 # handful of their edges weigh about 1e-20 and land outside their cluster,
 # which is module 2's kernel underflowing rather than a read being badly
-# placed; `cohesion < 1` would reject those 8 as well, and on this sample they
+# placed; `cohesion < 1` would reject those 2 as well, and on this sample they
 # are reads of two adjacent clusters whose shared boundary carries almost no
 # weight -- exactly the reads weighing the edges rather than counting them was
 # meant to keep.
@@ -236,9 +258,17 @@ def cluster(g):
 
 # ------------------------------------------------------------------- rejects
 def cohesion(g, mem):
-    """Per READ, the share of its edge weight that stays inside its cluster.
+    """Per READ, the share of the weight IT CHOSE that stays in its cluster.
 
-        sum of w(i,j) over j in i's own cluster / sum of w(i,j) over all j
+        sum of w(i,j) over j in i's own cluster AND chosen by i
+        ------------------------------------------------------
+        sum of w(i,j) over j chosen by i
+
+    "Chosen by i" is module 2's `claim_i`/`claim_j`: step 3 gave read i a
+    weight to its own `n_neighbors` nearest and to nothing else, so an edge
+    reaching i that i did not list is one somebody else asked for.  Both sums
+    skip it.  See the module docstring for the read that named this and for
+    what the two denominators score.
 
     Read off the edge list rather than an `n x n` co-association: the quantity
     is only ever wanted on the edges module 2 actually built, and a dense
@@ -247,7 +277,13 @@ def cohesion(g, mem):
     **A read with no edges reads 0.**  Nothing holds it anywhere, so nothing
     holds it where it was put -- the vacuous alternative, calling an empty sum
     perfectly cohesive, would let the one read module 2 could measure least
-    through the one rule meant to catch it.
+    through the one rule meant to catch it.  A read that chose nothing reads 0
+    for the same reason, though module 2 gives every measured read its
+    `n_neighbors`, so on a normal graph that case does not arise.
+
+    A graph built without the claim flags -- an older cache, a hand-made
+    `igraph` -- reads every edge as chosen by both ends, which is the rule this
+    function had before the flags existed.
 
     Computed against whatever partition it is handed, before any read has been
     unplaced, so every read is scored against the cluster Leiden chose for it.
@@ -257,13 +293,18 @@ def cohesion(g, mem):
         return np.zeros(n)
     edges = np.asarray(g.get_edgelist(), np.int64).reshape(-1, 2)
     w = np.asarray(g.es[W], float)
+    attrs = g.es.attributes()
+    ci = (np.asarray(g.es["claim_i"], bool) if "claim_i" in attrs
+          else np.ones(w.size, bool))
+    cj = (np.asarray(g.es["claim_j"], bool) if "claim_j" in attrs
+          else np.ones(w.size, bool))
     mem = np.asarray(mem)
     num, den = np.zeros(n), np.zeros(n)
     same = (mem[edges[:, 0]] == mem[edges[:, 1]]).astype(float)
-    np.add.at(num, edges[:, 0], w * same)
-    np.add.at(num, edges[:, 1], w * same)
-    np.add.at(den, edges[:, 0], w)
-    np.add.at(den, edges[:, 1], w)
+    np.add.at(num, edges[:, 0], w * same * ci)
+    np.add.at(num, edges[:, 1], w * same * cj)
+    np.add.at(den, edges[:, 0], w * ci)
+    np.add.at(den, edges[:, 1], w * cj)
     return np.where(den > 0, num / np.maximum(den, 1e-300), 0.0)
 
 
@@ -350,6 +391,77 @@ def _summarise(g, name, mem, why, dt, scores, detail):
                       scores=scores, score_col=SCORE_COL, detail=detail)
 
 
+# How many times the graph is cut.  A FIXED COUNT, run to the end.
+PASSES = 16
+
+
+def iterated_cut(g, reject_min_size, passes=PASSES):
+    """Cut, refuse, cut what is left.  `passes` times.  `(mem, why, scores, n)`.
+
+    **A refusal that arrives after the cut arrives too late.**  Leiden labels
+    every vertex, so a read that bridges two chromosome ends has already been
+    used to merge them by the time `cohesion` gets to say it belongs to
+    neither.  The rule catches the read and keeps the damage.  On the curated
+    sample all fourteen reads joining curated 47 to curated 62 were refused,
+    and the two stayed one cluster regardless.  So the refused reads are
+    DELETED -- the vertex, not just the label -- and what remains is cut again.
+
+    **The count is fixed and every pass is run**, rather than stopping at the
+    first pass that refuses nobody.  A later pass is not structurally a repeat:
+    igraph's Leiden draws from Python's `random`, so each call advances the
+    stream and cuts the same vertices from a different start, and a read that
+    only some partitions dispute would be refused by the first that does.
+
+    ON THIS GRAPH IT MAKES NO DIFFERENCE, and that is measured, not assumed.
+    HG08434.LCL-ONT-UL at the shipped step 1:
+
+        passes    k  unplaced     ARI  shattered  merged  caught
+             1   91        17  0.9862      1         1     12/12
+             2   92        17  0.9991      1         1     12/12
+         3..32   92        17  0.9991      1         1     12/12
+
+    Pass 1 refuses 17 and pass 2 refuses nobody; passes 3 to 32 return the same
+    partition every time, from a different RNG start each time.  That is the
+    same stability the deleted ECG branch ran into -- sixteen bootstrapped
+    Leidens there gave a partition identical to one Leiden -- and it says the
+    community structure here does not depend on where the search begins.  The
+    fourteen spare passes cost about 1.4s and buy nothing measurable; they are
+    run because a graph whose structure is less settled would be the case that
+    needs them, and that case has not been ruled out on the other nine samples.
+
+    Nothing accumulates a score across passes and nothing votes: a read is out
+    the moment any pass refuses it, and the reported partition is the last
+    pass's.  That makes this subtractive where an ensemble is additive, which
+    is why it needs no consensus rule and no threshold on agreement.
+
+    A read refused on an earlier pass is never reconsidered.  It keeps that
+    pass's reason and score, and the graph it was refused against only ever
+    loses edges afterwards.
+    """
+    n = g.vcount()
+    mem = [UNCLUSTERED] * n
+    why = ["" for _ in range(n)]
+    scores = np.zeros(n)
+    alive = list(range(n))
+    done = 0
+    for p in range(1, passes + 1):
+        if not alive:
+            break
+        sub = g if len(alive) == n else g.subgraph(alive)
+        m = cluster(sub)
+        c = cohesion(sub, m)
+        m, w = reject(m, c, reject_min_size)
+        for s, v in enumerate(alive):
+            mem[v], why[v], scores[v] = m[s], w[s], c[s]
+        still = [alive[s] for s, x in enumerate(m) if x is not UNCLUSTERED]
+        done = p
+        if len(still) != len(alive):
+            log(f"cluster: pass {p} refused {len(alive) - len(still):,}; "
+                f"{len(still):,} remain")
+        alive = still
+    return mem, why, scores, done
+
+
 def run(G, *, seed=0, reject_min_size=5):
     """Module 3 end to end.  Returns one `Assignment`."""
     import time
@@ -359,18 +471,17 @@ def run(G, *, seed=0, reject_min_size=5):
     log(f"cluster: {METHOD} on {g.vcount():,} vertices, seed {seed}")
 
     t0 = time.time()
-    mem = cluster(g)
-    coh = cohesion(g, mem)
-    mem, why = reject(mem, coh, reject_min_size)
+    mem, why, coh, passes = iterated_cut(g, reject_min_size)
     kept = np.array([m is not UNCLUSTERED for m in mem], bool)
-    detail = {"min_cohesion": MIN_COHESION,
+    detail = {"min_cohesion": MIN_COHESION, "passes": passes,
               "cohesion_placed_p50": float(np.median(coh[kept]))
               if kept.any() else float("nan"),
               "cohesion_unplaced_p50": float(np.median(coh[~kept]))
               if (~kept).any() else float("nan")}
     a = _summarise(g, METHOD, mem, why, time.time() - t0, coh, detail)
     log(f"cluster: cohesion  placed p50 {detail['cohesion_placed_p50']:.4f}"
-        f"  unplaced p50 {detail['cohesion_unplaced_p50']:.4f}")
+        f"  unplaced p50 {detail['cohesion_unplaced_p50']:.4f}"
+        f"  ({passes} pass{'es' if passes != 1 else ''})")
     tally = collections.Counter(w for w in why if w)
     log(f"cluster: {a.n_clusters:>5,} clusters  {a.n_unclustered:>4,} "
         f"unclustered  Q={a.modularity:6.3f}  {a.seconds:5.1f}s"

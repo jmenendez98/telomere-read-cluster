@@ -331,11 +331,15 @@ def _graph_stage(args, reads, cachedir, intake_sig):
     `graph.MAX_K_FRAC`, constants, and a change to either is a change to the
     module's code signature, which every one of the three stamps holds.
 
-    The weights carry that stamp plus `--n-neighbors` and `--mix-ratio`, the
-    two parameters that move steps 2-4 without moving the k-mer matrices above
-    them: sweeping either rebuilds the weights and reuses the database and the
-    matrices, which is where the time is.  Both are in the file name, so the
-    settings of a sweep sit side by side in one cache directory.
+    The weights carry that stamp plus `--n-neighbors`, and NOT `--mix-ratio`.
+    What is cached is step 3's directed matrix, the one whose support is "read
+    i chose read j"; step 4 mixes the two directions on the way out of
+    `graph.build`, every time, from whatever `r` this run was given.  So
+    sweeping `--mix-ratio` is free -- it reuses the database, the matrices AND
+    the weights, and touches only the last line of module 2 -- while sweeping
+    `--n-neighbors` rebuilds the weights and reuses everything above them,
+    which is where the time is.  `--n-neighbors` is in the file name, so the
+    settings of that sweep sit side by side in one cache directory.
     """
     name = _window_name(args)
     db_kw = dict(k=args.k, telo_bp=args.telo_bp, sub_bp=args.sub_bp)
@@ -360,11 +364,9 @@ def _graph_stage(args, reads, cachedir, intake_sig):
     if zv is not None:
         vec = _graph_mod.vectors_from_arrays(zv)
 
-    w_par = param_sig(n_neighbors=args.n_neighbors,
-                      mix_ratio=args.mix_ratio)
+    w_par = param_sig(n_neighbors=args.n_neighbors)
     w_sig = f"{db_sig}|{w_par}"
-    w_path = (cache_path(cachedir, f"weights.{name}.nn{args.n_neighbors}"
-                         f".mix{args.mix_ratio:g}.npz")
+    w_path = (cache_path(cachedir, f"weights.{name}.nn{args.n_neighbors}.npz")
               if cachedir else None)
     W = None
     zc = load_npz(w_path, w_sig)
@@ -375,8 +377,8 @@ def _graph_stage(args, reads, cachedir, intake_sig):
                                      n_neighbors=args.n_neighbors,
                                      mix_ratio=args.mix_ratio, **db_kw)
     if vec_path and zv is None:
-        # Raw counts, log1p of them, TF-IDF, and the columns they are over.
-        # Presence is all ones and is rebuilt from the same structure.
+        # Raw counts, log1p of them, the unit rows, and the columns they are
+        # over.  Presence is all ones and is rebuilt from the same structure.
         save_npz(vec_path, db_sig, **_graph_mod.vectors_arrays(vec))
     if w_path and zc is None:
         save_npz(w_path, w_sig, **_graph_mod.weights_arrays(W))
@@ -540,12 +542,21 @@ def _unplaced_tally(rows):
 
 
 def _write_edges(path, reads, G):
+    """One row per exported edge.
+
+    `chose` says which END asked for this edge -- `both`, `i` or `j`.  Step 3
+    gives a read a weight to its own `--n-neighbors` nearest and to nothing
+    else, so an edge is one-way whenever the read at the other end had ten
+    better options; module 3's refusal reads the same distinction, and without
+    this column it cannot be checked from the tables.
+    """
     rows = [{"read_i": reads[int(i)].read_id, "read_j": reads[int(j)].read_id,
-             "weight": float(w), "n_shared": int(n), "idf_shared": float(g)}
-            for (i, j), w, n, g in zip(G.pairs, G.weights, G.n_shared,
-                                       G.idf_shared)]
+             "weight": float(w), "n_shared": int(n), "idf_shared": float(g),
+             "chose": "both" if (ci and cj) else ("i" if ci else "j")}
+            for (i, j), w, n, g, (ci, cj) in zip(G.pairs, G.weights, G.n_shared,
+                                                 G.idf_shared, G.claims)]
     write_tsv(path, rows, ["read_i", "read_j", "weight", "n_shared",
-                           "idf_shared"])
+                           "idf_shared", "chose"])
 
 
 # ----------------------------------------------------------------------- main
