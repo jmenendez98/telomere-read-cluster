@@ -1,4 +1,5 @@
-"""`python -m trc` runs the same CLI the `trc` console script does."""
+"""`python -m trc`."""
+
 import sys
 
 from .main import main

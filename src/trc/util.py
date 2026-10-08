@@ -1,19 +1,5 @@
-"""Logging, thread count, TSV/JSON writing, and a cache that detects staleness.
+"""Logging, thread counts, cache signatures and atomic file writes."""
 
-Not a fourth module in the pipeline sense -- nothing here decides anything
-about a read.  It is the plumbing the three modules and the CLI share.
-
-**The caching discipline.**  A stage's file is stamped with the parameters that
-stage actually reads, with the size and mtime of the upstream input, and with a
-hash of the SOURCE of the modules that produce it.  It is reused only when
-every one of them is unchanged, so editing a constant -- or editing a function
-without touching any constant -- invalidates exactly the stages downstream of
-it and nothing above.  There is no cache to clear by hand.
-
-Writes go through a temporary name and are renamed into place, so a job killed
-partway leaves either the old cache or the new one, never a truncated file a
-later run would trust.
-"""
 from __future__ import annotations
 
 import gzip
@@ -27,23 +13,23 @@ import time
 import numpy as np
 
 T0 = time.time()
-# On for anything that imports these modules directly.  The CLI turns it off
-# unless -v/--verbose was given, so a `trc` run is silent by default.
 _QUIET = False
 
 
 def verbose(on=True):
+    """Turn progress logging on or off."""
     global _QUIET
     _QUIET = not on
 
 
 def log(msg):
+    """Print msg to stderr, stamped with seconds since import."""
     if not _QUIET:
         print(f"[{time.time() - T0:7.1f}s] {msg}", file=sys.stderr, flush=True)
 
 
 def n_threads(requested=0):
-    """`--threads`, or every core this job can actually see."""
+    """The requested count, else SLURM's CPUs, else every core."""
     if requested:
         return max(int(requested), 1)
     for var in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
@@ -53,44 +39,35 @@ def n_threads(requested=0):
     return os.cpu_count() or 1
 
 
-# --------------------------------------------------------------------- stamps
 def input_sig(path):
-    """Size and mtime of an input file, as the upstream half of a cache stamp."""
+    """Cache signature of a file: its size and mtime."""
     st = os.stat(path)
     return f"{st.st_size}:{int(st.st_mtime)}"
 
 
 def code_sig(*modules):
-    """A hash of the source of the modules a cached stage is produced by.
-
-    Stamping parameter VALUES alone leaves a standing hazard: change a function
-    without changing any constant and the cache is reused and is wrong.  This
-    closes that by construction, with nothing to remember.
-    """
+    """Hash of the modules' source, so any edit invalidates the cache."""
     h = hashlib.sha1()
     for m in modules:
         try:
             h.update(inspect.getsource(m).encode())
         except (OSError, TypeError):
-            # Source unavailable (frozen, or defined interactively); invalidate
-            # nothing rather than crash a run.
             h.update(repr(m).encode())
     return h.hexdigest()[:12]
 
 
 def param_sig(**kw):
-    """The parameters a stage reads, as one order-independent string."""
+    """Cache signature of keyword parameters, in sorted order."""
     return "|".join(f"{k}={kw[k]}" for k in sorted(kw))
 
 
-# ---------------------------------------------------------------------- cache
 def cache_path(cachedir, name):
     os.makedirs(cachedir, exist_ok=True)
     return os.path.join(cachedir, name)
 
 
 def load_npz(path, sig):
-    """The cached arrays if the stamp matches, else None."""
+    """Cached arrays, or None if absent, unreadable or of another sig."""
     if not path or not os.path.exists(path):
         return None
     try:
@@ -99,15 +76,13 @@ def load_npz(path, sig):
             return None
         return z
     except Exception:
-        # A corrupt or half-written cache is a cache miss, not a crash.
         return None
 
 
 def save_npz(path, sig, **arrays):
+    """Write arrays and their sig atomically; no-op without a path."""
     if not path:
         return
-    # Through a file handle, not a name: np.savez appends ".npz" to a path that
-    # lacks it, which would rename a file that is not the one just written.
     tmp = f"{path}.tmp{os.getpid()}"
     with open(tmp, "wb") as fh:
         np.savez(fh, __sig__=np.array(sig), **arrays)
@@ -115,13 +90,7 @@ def save_npz(path, sig, **arrays):
 
 
 def save_seqs(path, seqs):
-    """Sequences as gzipped text, one per line, not as a numpy array.
-
-    A numpy unicode array is fixed-width: it pads every row out to the longest
-    read.  On a sample whose longest read is ~1 Mb that turns a 220 Mbp cache
-    into a 13.6 GB file.  compresslevel 4 because DNA reaches most of its ratio
-    in the first few levels and 9 costs minutes to save a few percent.
-    """
+    """Write one sequence per line, gzipped, atomically."""
     tmp = f"{path}.tmp{os.getpid()}"
     with gzip.open(tmp, "wt", compresslevel=4) as fh:
         for s in seqs:
@@ -134,12 +103,8 @@ def load_seqs(path):
         return [line.rstrip("\n") for line in fh]
 
 
-# --------------------------------------------------------------------- output
 def write_tsv(path, rows, columns):
-    """One header, one row per record, LF line endings.
-
-    LF and not the CRLF `csv` defaults to, so `awk -F'\\t'` works on the result.
-    """
+    """Write dict rows as a TSV atomically; None is written as NA."""
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     tmp = f"{path}.tmp{os.getpid()}"
     with open(tmp, "w", newline="\n") as fh:
@@ -151,9 +116,6 @@ def write_tsv(path, rows, columns):
 
 
 def _fmt(v):
-    # None is the tables' "this read never reached the stage that measures
-    # this" -- a row for a read dropped at intake has no strength and no
-    # degree, and writing 0 for them would be a measurement rather than a gap.
     if v is None:
         return "NA"
     if isinstance(v, float):
@@ -162,6 +124,7 @@ def _fmt(v):
 
 
 def write_json(path, obj):
+    """Write obj as sorted, indented JSON atomically."""
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     tmp = f"{path}.tmp{os.getpid()}"
     with open(tmp, "w") as fh:
@@ -172,6 +135,7 @@ def write_json(path, obj):
 
 
 def _jsonable(o):
+    """json.dump fallback for numpy values and tuples."""
     if isinstance(o, np.integer):
         return int(o)
     if isinstance(o, np.floating):
